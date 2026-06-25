@@ -1,0 +1,10 @@
+firmware/**/config.h
+firmware/**/config.py
+backend/.env
+backend/.venv/
+backend/.pytest_cache/
+backend/data/
+backend/*.log
+__pycache__/
+*.pyc
+.DS_Store

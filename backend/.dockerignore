@@ -1,0 +1,8 @@
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+data/*.jsonl
+backend.log
+tunnel.log
+.DS_Store
