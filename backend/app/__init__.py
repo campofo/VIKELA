@@ -1,1 +1,0 @@
-"""VIKELA Flask backend package."""
