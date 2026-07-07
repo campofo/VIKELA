@@ -3,6 +3,7 @@ import select
 import sys
 import time
 
+import machine
 from machine import Pin, UART
 
 # ---------------------------------------------------------------------------
@@ -21,7 +22,7 @@ CELLULAR_PASS = ""
 # For cellular testing, use a public URL. Local 192.168.x.x addresses are
 # usually not reachable from the SIM7000G cellular network.
 # Example: "https://example.com/api/alerts/hardware"
-BACKEND_ALERT_URL = "http://yourusername.pythonanywhere.com/api/alerts/hardware"
+BACKEND_ALERT_URL = "https://europe-west1-dara-cd3e8.cloudfunctions.net/hardwareAlert"
 
 # Device/user identity sent in HTTP payloads and SMS fallback messages.
 DEVICE_ID = "VIKELA-T-SIM7000G-001"
@@ -29,12 +30,15 @@ USER_ID = "user-001"
 USER_DISPLAY_NAME = "VIKELA User"
 
 # SMS fallback settings.
+# Used only when Firebase is unreachable. Firestore (via the mobile app) is the
+# source of truth for emergency contacts; these locals are the offline backup.
 SMS_MESSAGE_PREFIX = "VIKELA EMERGENCY ALERT"
 EMERGENCY_CONTACTS = [
-    "+233000000000"
+    "+233504647863"
 ]
-FETCH_CONTACTS_FROM_BACKEND = True
-BACKEND_CONTACT_NUMBERS_URL = ""
+# SMS service centre (SMSC) number for the SIM's network. Leave blank to use
+# whatever the SIM provides; set it if SMS sends fail with "CMS ERROR: 500".
+SMSC_NUMBER = ""
 SEND_BOOT_SMS_ON_START = False
 BOOT_SMS_MESSAGE = "VIKELA device powered on"
 
@@ -46,7 +50,10 @@ MODEM_POWER_ON = 23
 MODEM_RST = 5
 
 # VIKELA panic-device pins.
-PANIC_BUTTON_PIN = 32
+# Any button held on one of these GPIO pins triggers a panic alert.
+# 32 is an external button; 0 is the onboard BOOT button.
+# Note: RST/EN is a hardware reset button and cannot be used here.
+PANIC_BUTTON_PINS = [32, 0]
 STATUS_LED_PIN = 12
 STATUS_LED_ACTIVE_LOW = True
 
@@ -56,14 +63,27 @@ NETWORK_TIMEOUT_MS = 60000
 GPS_TIMEOUT_MS = 90000
 BOOT_GPS_TIMEOUT_MS = 30000
 HTTP_TIMEOUT_MS = 30000
-CONTACTS_HTTP_TIMEOUT_MS = 20000
 DEV_SERIAL_TRIGGER_ENABLED = True
 DEV_SERIAL_TRIGGER_KEY = "p"
-SEND_PANIC_ON_BOOT = True
+SEND_PANIC_ON_BOOT = False
 GPS_CACHE_FILE = "last_gps.json"
 CONTACTS_CACHE_FILE = "panic_contacts.json"
 GPS_REFRESH_INTERVAL_MS = 60000
 GPS_REFRESH_TIMEOUT_MS = 15000
+
+# RST multi-press trigger (no external button needed).
+# Press the onboard RST button PANIC_RESET_COUNT times in a row to fire a panic.
+RESET_TRIGGER_ENABLED = True
+PANIC_RESET_COUNT = 3
+RESET_MULTIPRESS_WINDOW_MS = 10000    # max gap between presses before the count clears
+RESET_TRIGGER_FILE = "reset_trigger.json"
+COUNT_RESET_CAUSE = "pwron"           # this board reports the RST button as a power-on reset ("hard" if yours reports HARD_RESET)
+
+# Remote trigger: raise a panic by texting the device from an authorised number.
+REMOTE_TRIGGER_ENABLED = True
+PANIC_CALLER_NUMBERS = ["+233504647863", "+233555192380"]
+PANIC_SMS_KEYWORD = ""                # empty = any SMS from a whitelisted number fires; else require this substring
+REMOTE_TRIGGER_POLL_MS = 5000         # how often to poll the modem for new SMS
 
 
 class Led:
@@ -136,6 +156,7 @@ class Sim7000:
         self.power_on = Pin(MODEM_POWER_ON, Pin.OUT)
         self.pwrkey = Pin(MODEM_PWRKEY, Pin.OUT)
         self.reset = Pin(MODEM_RST, Pin.OUT)
+        self._remote_inbox_cleared = False
 
     def clear(self):
         while self.uart.any():
@@ -201,6 +222,20 @@ class Sim7000:
         self.at("AT+CPIN?", 3000)
         self.at("AT+CFUN=1", 5000)
         self.at("AT+COPS=0", 10000)
+        if REMOTE_TRIGGER_ENABLED:
+            self.enable_remote_trigger()
+
+    def enable_remote_trigger(self):
+        # Prepare the modem to raise a panic from an incoming SMS (reliable on the
+        # SIM7000G) or an incoming call (only if the module exposes voice).
+        self.at("AT+CMGF=1", 3000)          # SMS text mode
+        self.at("AT+CNMI=2,1,0,0,0", 3000)  # new-SMS indication (+CMTI)
+        self.at("AT+CLIP=1", 3000)          # caller ID for RING (harmless without voice)
+        if not self._remote_inbox_cleared:
+            # Clear any messages already sitting on the SIM so stale texts can't
+            # trigger a panic, but only once per power cycle.
+            self.at("AT+CMGD=1,4", 5000)
+            self._remote_inbox_cleared = True
 
     def print_registration_diagnostics(self):
         self.at("AT+CPIN?", 1500)
@@ -227,20 +262,38 @@ class Sim7000:
             time.sleep_ms(1000)
         return False
 
-    def configure_pdp(self):
-        apn = CELLULAR_APN
-        self.at('AT+SAPBR=3,1,"Contype","GPRS"', 3000)
-        self.at('AT+SAPBR=3,1,"APN","{}"'.format(apn), 3000)
-        if CELLULAR_USER:
-            self.at('AT+SAPBR=3,1,"USER","{}"'.format(CELLULAR_USER), 3000)
-        if CELLULAR_PASS:
-            self.at('AT+SAPBR=3,1,"PWD","{}"'.format(CELLULAR_PASS), 3000)
-        self.at("AT+SAPBR=0,1", 5000)
-        ok, _ = self.at("AT+SAPBR=1,1", 20000)
+    def _network_active(self):
+        ok, response = self.at("AT+CNACT?", 3000)
         if not ok:
             return False
-        ok, _ = self.at("AT+SAPBR=2,1", 5000)
-        return ok
+        for line in response.splitlines():
+            line = line.strip()
+            if not line.startswith("+CNACT:"):
+                continue
+            ip = line.split(",")[-1].strip().strip('"')
+            if ip and ip != "0.0.0.0":
+                return True
+        return False
+
+    def activate_network(self):
+        # App-layer packet data activation for the SH HTTP(S) stack
+        # (SIM7000/7070 series). Replaces the legacy SAPBR bearer, which
+        # cannot do TLS on this modem.
+        if self._network_active():
+            return True
+        # The exact argument form varies by modem firmware revision; try the
+        # newer 3-argument form first, then the legacy 2-argument form.
+        for command in (
+            'AT+CNACT=0,1,"{}"'.format(CELLULAR_APN),
+            'AT+CNACT=1,"{}"'.format(CELLULAR_APN),
+        ):
+            self.at(command, 8000)
+            started = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), started) < 8000:
+                if self._network_active():
+                    return True
+                time.sleep_ms(1000)
+        return False
 
     def acquire_gps(self, led, timeout_ms):
         self.at("AT+SGPIO=0,4,1,1", 3000)
@@ -270,90 +323,102 @@ class Sim7000:
             print("Only http:// and https:// URLs are supported.")
             return False
 
-        if not self.configure_pdp():
-            print("PDP context setup failed.")
+        if not self.activate_network():
+            print("Data network activation (CNACT) failed.")
             return False
 
         body = json.dumps(payload)
-        self.at("AT+HTTPTERM", 2000)
-        ok, _ = self.at("AT+HTTPINIT", 5000)
-        if not ok:
-            return False
-        self.at("AT+HTTPPARA=\"CID\",1", 3000)
+        base_url = "{}://{}".format("https" if parsed["ssl"] else "http", parsed["host"])
+        if parsed["port"]:
+            base_url += ":" + parsed["port"]
+        path = parsed["path"]
+
+        # Clear any previous SH session before configuring a new one.
+        self.at("AT+SHDISC", 2000)
+
         if parsed["ssl"]:
-            ok, _ = self.at("AT+HTTPSSL=1", 3000)
+            # TLS 1.2 on SSL context 1, bound to the SH HTTP stack. authmode 0
+            # skips server-certificate verification (no CA cert is loaded on the
+            # modem), which is what lets the handshake to Google/Firebase complete.
+            self.at('AT+CSSLCFG="sslversion",1,3', 3000)
+            self.at('AT+CSSLCFG="authmode",1,0', 3000)
+            ok, _ = self.at('AT+SHSSL=1,""', 3000)
             if not ok:
-                print("HTTPS setup failed on modem.")
-                self.at("AT+HTTPTERM", 2000)
+                print("TLS setup (SHSSL) failed on modem.")
                 return False
         else:
-            self.at("AT+HTTPSSL=0", 3000)
-        self.at("AT+HTTPPARA=\"URL\",\"{}\"".format(url), 3000)
-        self.at("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 3000)
+            self.at('AT+SHSSL=0,""', 3000)
 
-        ok, response = self.at("AT+HTTPDATA={},10000".format(len(body)), 5000, "DOWNLOAD")
+        self.at('AT+SHCONF="URL","{}"'.format(base_url), 3000)
+        self.at('AT+SHCONF="BODYLEN",1024', 3000)
+        self.at('AT+SHCONF="HEADERLEN",350', 3000)
+
+        ok, conn_response = self.at("AT+SHCONN", timeout_ms)
         if not ok:
-            self.at("AT+HTTPTERM", 2000)
+            print("SHCONN failed (could not connect to server):", conn_response.strip())
+            self.at("AT+SHDISC", 2000)
+            return False
+
+        ok, state = self.at("AT+SHSTATE?", 3000)
+        if not ok or "+SHSTATE: 1" not in state:
+            print("SH connection not established.")
+            self.at("AT+SHDISC", 2000)
+            return False
+
+        # Fresh header set with a JSON content type.
+        self.at("AT+SHCHEAD", 2000)
+        self.at('AT+SHAHEAD="Content-Type","application/json"', 3000)
+
+        ok, _ = self.at("AT+SHBOD={},10000".format(len(body)), 5000, ">")
+        if not ok:
+            print("SHBOD prompt not received.")
+            self.at("AT+SHDISC", 2000)
             return False
         self.uart.write(body.encode())
-        response = self.read_until("OK", 12000)
-        print("AT<", response.strip())
-        if "OK" not in response:
-            self.at("AT+HTTPTERM", 2000)
-            return False
+        self.read_until("OK", 5000)
 
         self.clear()
-        self.uart.write(b"AT+HTTPACTION=1\r\n")
-        response = self.read_until("+HTTPACTION:", timeout_ms)
+        self.uart.write('AT+SHREQ="{}",3\r\n'.format(path).encode())
+        response = self.read_until("+SHREQ:", timeout_ms)
         response += self.read_until("OK", 5000)
         print("AT<", response.strip())
-        self.at("AT+HTTPTERM", 2000)
-        return http_action_success(response)
+        status = shreq_status(response)
+        self.at("AT+SHDISC", 2000)
+        if status is not None and 200 <= status < 300:
+            return True
+        print("Server returned HTTP status:", status)
+        return False
 
-    def http_get_json(self, url, timeout_ms):
-        parsed = parse_http_url(url)
-        if not parsed:
-            print("Only http:// and https:// URLs are supported.")
-            return None
-
-        if not self.configure_pdp():
-            print("PDP context setup failed.")
-            return None
-
-        self.at("AT+HTTPTERM", 2000)
-        ok, _ = self.at("AT+HTTPINIT", 5000)
+    def read_battery(self):
+        ok, response = self.at("AT+CBC", 3000)
         if not ok:
-            return None
-        self.at("AT+HTTPPARA=\"CID\",1", 3000)
-        if parsed["ssl"]:
-            ok, _ = self.at("AT+HTTPSSL=1", 3000)
-            if not ok:
-                print("HTTPS setup failed on modem.")
-                self.at("AT+HTTPTERM", 2000)
-                return None
-        else:
-            self.at("AT+HTTPSSL=0", 3000)
-        self.at("AT+HTTPPARA=\"URL\",\"{}\"".format(url), 3000)
+            return -1
+        for line in response.splitlines():
+            line = line.strip()
+            if not line.startswith("+CBC:"):
+                continue
+            # +CBC: <bcs>,<bcl>,<voltage_mV> -- bcl is the charge percentage.
+            try:
+                return int(line.split(":", 1)[1].split(",")[1].strip())
+            except (IndexError, ValueError):
+                return -1
+        return -1
 
-        self.clear()
-        self.uart.write(b"AT+HTTPACTION=0\r\n")
-        response = self.read_until("+HTTPACTION:", timeout_ms)
-        response += self.read_until("OK", 5000)
-        print("AT<", response.strip())
-        if not http_action_success(response):
-            self.at("AT+HTTPTERM", 2000)
-            return None
-
-        ok, read_response = self.at("AT+HTTPREAD", 10000)
-        self.at("AT+HTTPTERM", 2000)
-        if not ok:
-            return None
-        return parse_httpread_json(read_response)
+    def ensure_smsc(self):
+        # A missing SMSC (service centre) is the usual cause of "CMS ERROR: 500"
+        # on send. If one is configured locally, make sure the modem has it.
+        if not SMSC_NUMBER:
+            return
+        ok, response = self.at("AT+CSCA?", 3000)
+        if ok and SMSC_NUMBER in response:
+            return
+        self.at('AT+CSCA="{}"'.format(SMSC_NUMBER), 3000)
 
     def send_sms(self, number, message):
         self.at("AT+CMGF=1", 3000)
         self.at('AT+CSCS="GSM"', 3000)
         self.at("AT+CSMP=17,167,0,0", 3000)
+        self.ensure_smsc()
         print("Sending SMS to {}".format(number))
         self.clear()
         self.uart.write(('AT+CMGS="{}"\r\n'.format(number)).encode())
@@ -373,6 +438,44 @@ class Sim7000:
         print("SMS send {}".format("succeeded" if sent else "failed"))
         return sent
 
+    def check_sms_trigger(self):
+        # Poll unread messages; fire if any is from a whitelisted number (and
+        # contains PANIC_SMS_KEYWORD, when set). Polling is more robust than
+        # relying on +CMTI URCs, which an in-flight AT command can swallow.
+        ok, response = self.at('AT+CMGL="REC UNREAD"', 8000)
+        if not ok or "+CMGL:" not in response:
+            return False
+        triggered = False
+        for sender, body in parse_cmgl(response):
+            if not caller_is_whitelisted(sender):
+                continue
+            if PANIC_SMS_KEYWORD and PANIC_SMS_KEYWORD.lower() not in body.lower():
+                continue
+            print("Panic SMS trigger from:", sender)
+            triggered = True
+        # Clear the inbox either way so a handled or ignored message can't retrigger.
+        self.at("AT+CMGD=1,4", 5000)
+        return triggered
+
+    def check_incoming_call(self):
+        # Bonus path: detect an incoming call (only works if the module has voice).
+        if not self.uart.any():
+            return False
+        text = self.uart.read()
+        if not text:
+            return False
+        text = text.decode("utf-8", "ignore")
+        if "RING" not in text and "+CLIP:" not in text:
+            return False
+        number = parse_clip_number(text)
+        self.at("ATH", 3000)  # hang up; we never answer
+        if caller_is_whitelisted(number):
+            print("Panic call trigger from:", number)
+            return True
+        if number:
+            print("Ignoring call from non-whitelisted number:", number)
+        return False
+
 
 def parse_http_url(url):
     if url.startswith("http://"):
@@ -386,54 +489,75 @@ def parse_http_url(url):
     slash = rest.find("/")
     host_port = rest if slash < 0 else rest[:slash]
     path = "/" if slash < 0 else rest[slash:]
-    host = host_port.split(":", 1)[0]
-    return {"host": host, "path": path, "ssl": ssl}
+    if ":" in host_port:
+        host, port = host_port.split(":", 1)
+    else:
+        host, port = host_port, ""
+    return {"host": host, "port": port, "path": path, "ssl": ssl}
 
 
-def backend_contact_numbers_url():
-    if BACKEND_CONTACT_NUMBERS_URL:
-        return BACKEND_CONTACT_NUMBERS_URL
-
-    marker = "/api/alerts/hardware"
-    index = BACKEND_ALERT_URL.find(marker)
-    if index >= 0:
-        return BACKEND_ALERT_URL[:index] + "/api/panic-contacts/numbers"
-
-    parsed = parse_http_url(BACKEND_ALERT_URL)
-    if not parsed:
-        return ""
-
-    scheme = "https://" if parsed["ssl"] else "http://"
-    rest = BACKEND_ALERT_URL[len(scheme):]
-    slash = rest.find("/")
-    base = scheme + (rest if slash < 0 else rest[:slash])
-    return base + "/api/panic-contacts/numbers"
-
-
-def http_action_success(response):
+def shreq_status(response):
+    # Parse the HTTP status from an async +SHREQ: "POST",<status>,<len> line.
     for line in response.splitlines():
-        if "+HTTPACTION:" not in line:
+        if "+SHREQ:" not in line:
             continue
         try:
-            parts = line.split(":", 1)[1].split(",")
-            status = int(parts[1].strip())
-            return 200 <= status < 300
+            return int(line.split(":", 1)[1].split(",")[1].strip())
         except (IndexError, ValueError):
-            return False
+            return None
+    return None
+
+
+def caller_is_whitelisted(number):
+    # Compare on trailing digits so international (+233...), national (0...), and
+    # bare forms of the same number all match.
+    if not number:
+        return False
+    digits = "".join(ch for ch in number if ch.isdigit())
+    if not digits:
+        return False
+    for allowed in PANIC_CALLER_NUMBERS:
+        adigits = "".join(ch for ch in allowed if ch.isdigit())
+        if not adigits:
+            continue
+        tail = min(len(digits), len(adigits), 9)
+        if digits[-tail:] == adigits[-tail:]:
+            return True
     return False
 
 
-def parse_httpread_json(response):
-    start = response.find("{")
-    end = response.rfind("}")
-    if start < 0 or end < start:
-        print("HTTP response did not contain JSON.")
-        return None
-    try:
-        return json.loads(response[start:end + 1])
-    except ValueError as exc:
-        print("Could not parse HTTP JSON:", exc)
-        return None
+def parse_clip_number(text):
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("+CLIP:"):
+            continue
+        start = line.find('"')
+        end = line.find('"', start + 1)
+        if start >= 0 and end > start:
+            return line[start + 1:end]
+    return None
+
+
+def parse_cmgl(response):
+    # Parse AT+CMGL text-mode output into (sender, body) tuples. Each message is a
+    # +CMGL: <idx>,"<stat>","<sender>",... header line followed by the body line.
+    messages = []
+    lines = response.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line.startswith("+CMGL:"):
+            continue
+        fields = line.split(",")
+        sender = None
+        if len(fields) >= 3:
+            sender = fields[2].strip().strip('"')
+        body = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        messages.append((sender, body))
+    return messages
+
+
+def due(last_ms, interval_ms):
+    return time.ticks_diff(time.ticks_ms(), last_ms) >= interval_ms
 
 
 def valid_phone_number(number):
@@ -461,21 +585,6 @@ def clean_contact_numbers(numbers):
     return cleaned
 
 
-def save_contact_cache(numbers):
-    numbers = clean_contact_numbers(numbers)
-    if not numbers:
-        return
-    try:
-        with open(CONTACTS_CACHE_FILE, "w") as handle:
-            handle.write(json.dumps({
-                "phone_numbers": numbers,
-                "saved_ms": time.ticks_ms(),
-            }))
-        print("Saved panic contact cache.")
-    except Exception as exc:
-        print("Could not save panic contact cache:", exc)
-
-
 def load_contact_cache():
     try:
         with open(CONTACTS_CACHE_FILE, "r") as handle:
@@ -488,35 +597,17 @@ def load_contact_cache():
     return []
 
 
-def fallback_panic_contacts(reason):
+def get_panic_contacts():
+    # Emergency contacts now live in Firestore (managed by the mobile app).
+    # The firmware only needs local numbers for the offline SMS fallback used
+    # when Firebase is unreachable: a locally-provisioned cache, else the
+    # built-in EMERGENCY_CONTACTS.
     cached = load_contact_cache()
     if cached:
-        print("{}; using saved panic contact cache.".format(reason))
+        print("Using saved panic contact cache for SMS fallback.")
         return cached
-    print("{}; using built-in local contacts.".format(reason))
+    print("Using built-in local emergency contacts for SMS fallback.")
     return EMERGENCY_CONTACTS
-
-
-def get_panic_contacts(modem):
-    if not FETCH_CONTACTS_FROM_BACKEND:
-        return fallback_panic_contacts("Backend contact fetch disabled")
-
-    url = backend_contact_numbers_url()
-    if not url:
-        return fallback_panic_contacts("Backend contact URL unavailable")
-
-    print("Fetching panic contacts from backend.")
-    data = modem.http_get_json(url, CONTACTS_HTTP_TIMEOUT_MS)
-    if not data:
-        return fallback_panic_contacts("Backend contacts unavailable")
-
-    numbers = clean_contact_numbers(data.get("phone_numbers"))
-    if not numbers:
-        return fallback_panic_contacts("Backend returned no enabled contacts")
-
-    save_contact_cache(numbers)
-    print("Using {} backend panic contact(s).".format(len(numbers)))
-    return numbers
 
 
 def parse_cgnsinf(response):
@@ -581,18 +672,61 @@ def fix_age_seconds(fix):
     return age_ms // 1000
 
 
-def build_alert_payload(fix):
+def load_reset_count():
+    try:
+        with open(RESET_TRIGGER_FILE, "r") as handle:
+            return int(json.loads(handle.read()).get("count", 0))
+    except Exception:
+        return 0
+
+
+def save_reset_count(count):
+    try:
+        with open(RESET_TRIGGER_FILE, "w") as handle:
+            handle.write(json.dumps({"count": count}))
+    except Exception as exc:
+        print("Could not save reset counter:", exc)
+
+
+def clear_reset_count():
+    save_reset_count(0)
+
+
+def evaluate_reset_trigger():
+    # Detect an "RST pressed N times in a row" panic gesture. The RST line is not
+    # a readable GPIO, but the chip reports why it booted, so we count qualifying
+    # resets in flash. Returns (should_panic, current_count).
+    if not RESET_TRIGGER_ENABLED:
+        return False, 0
+
+    cause = machine.reset_cause()
+    counted_cause = machine.PWRON_RESET if COUNT_RESET_CAUSE == "pwron" else machine.HARD_RESET
+    if cause == counted_cause:
+        count = load_reset_count() + 1
+        print("Counted reset (cause {}). Multi-press count: {}".format(cause, count))
+    else:
+        # Power-on / brownout / soft reset: start the gesture fresh.
+        count = 0
+        print("Boot reset cause {}; multi-press counter cleared.".format(cause))
+
+    if count >= PANIC_RESET_COUNT:
+        print("RST triple-press registered; panic trigger armed.")
+        clear_reset_count()
+        return True, 0
+
+    save_reset_count(count)
+    return False, count
+
+
+def build_alert_payload(fix, battery_level):
+    # Documented Firebase hardwareAlert contract: the firmware only reports who
+    # it is and where it is. Firebase resolves the user from the device ID and
+    # builds the emergency message itself.
     return {
         "device_id": DEVICE_ID,
-        "user_id": USER_ID,
-        "trigger_type": "hardware",
         "latitude": fix["latitude"] if fix else None,
         "longitude": fix["longitude"] if fix else None,
-        "location_source": fix.get("source", "sim7000g_gps") if fix else "unavailable",
-        "delivery_attempt": "cellular_http",
-        "battery_level": -1,
-        "timestamp": "unavailable",
-        "message": SMS_MESSAGE_PREFIX,
+        "battery_level": battery_level,
     }
 
 
@@ -641,8 +775,16 @@ def build_boot_sms_message(fix):
     return "\n".join(append_location_lines(lines, fix))
 
 
-def wait_for_button_hold(button, led):
-    if button.value() == 1:
+def pressed_button(buttons):
+    for button in buttons:
+        if button.value() == 0:
+            return button
+    return None
+
+
+def wait_for_button_hold(buttons, led):
+    button = pressed_button(buttons)
+    if button is None:
         return False
 
     pressed_at = time.ticks_ms()
@@ -724,7 +866,8 @@ def deliver_alert(modem, led, prefer_cached_location=True):
             print("GPS timed out; continuing without coordinates.")
 
     led.set_pattern(Led.SENDING)
-    payload = build_alert_payload(fix)
+    battery = modem.read_battery()
+    payload = build_alert_payload(fix, battery)
     if modem.http_post_json(BACKEND_ALERT_URL, payload, HTTP_TIMEOUT_MS):
         print("HTTP alert delivered.")
         return True
@@ -732,7 +875,7 @@ def deliver_alert(modem, led, prefer_cached_location=True):
     print("HTTP failed; sending SMS fallback.")
     sms = build_sms_message(fix)
     delivered = False
-    for number in get_panic_contacts(modem):
+    for number in get_panic_contacts():
         led.update()
         if modem.send_sms(number, sms):
             delivered = True
@@ -770,7 +913,7 @@ def send_boot_sms(modem, led):
     led.set_pattern(Led.SENDING)
     message = build_boot_sms_message(fix)
     delivered = False
-    for number in get_panic_contacts(modem):
+    for number in get_panic_contacts():
         led.update()
         if modem.send_sms(number, message):
             delivered = True
@@ -799,10 +942,19 @@ def send_boot_panic_alert(modem, led):
 
 def main():
     led = Led(STATUS_LED_PIN, STATUS_LED_ACTIVE_LOW)
-    button = Pin(PANIC_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+    buttons = [Pin(pin, Pin.IN, Pin.PULL_UP) for pin in PANIC_BUTTON_PINS]
     modem = Sim7000()
 
+    panic_from_reset, reset_count = evaluate_reset_trigger()
+    reset_window_start = time.ticks_ms()
+
     print("VIKELA MicroPython LILYGO T-SIM7000G panic firmware ready.")
+    if RESET_TRIGGER_ENABLED:
+        print("Reset trigger: press RST {} times in a row to send a panic alert.".format(
+            PANIC_RESET_COUNT
+        ))
+    if REMOTE_TRIGGER_ENABLED:
+        print("Remote trigger: text this device from an authorised number to send a panic alert.")
     if DEV_SERIAL_TRIGGER_ENABLED:
         print("Dev trigger: type '{}' in the serial console to send a panic alert.".format(
             DEV_SERIAL_TRIGGER_KEY
@@ -810,11 +962,33 @@ def main():
     led.set_pattern(Led.IDLE)
     send_boot_sms(modem, led)
     send_boot_panic_alert(modem, led)
+
+    if panic_from_reset:
+        print("RST multi-press panic trigger accepted.")
+        ok = deliver_alert(modem, led, prefer_cached_location=True)
+        led.blink_for(Led.SUCCESS if ok else Led.ERROR, 5000)
+        led.set_pattern(Led.IDLE)
+        reset_count = 0
+
     last_gps_refresh = time.ticks_ms() - GPS_REFRESH_INTERVAL_MS
+    last_remote_poll = time.ticks_ms()
 
     while True:
         led.update()
-        if wait_for_button_hold(button, led) or read_serial_trigger():
+
+        # A lone RST press must be followed by the next one within the window,
+        # otherwise the multi-press gesture resets.
+        if reset_count > 0 and due(reset_window_start, RESET_MULTIPRESS_WINDOW_MS):
+            clear_reset_count()
+            reset_count = 0
+            print("Reset multi-press window expired; counter cleared.")
+
+        triggered = wait_for_button_hold(buttons, led) or read_serial_trigger()
+        if not triggered and REMOTE_TRIGGER_ENABLED and due(last_remote_poll, REMOTE_TRIGGER_POLL_MS):
+            last_remote_poll = time.ticks_ms()
+            triggered = modem.check_incoming_call() or modem.check_sms_trigger()
+
+        if triggered:
             print("Panic trigger accepted.")
             ok = deliver_alert(modem, led, prefer_cached_location=True)
             if ok:
@@ -822,7 +996,7 @@ def main():
             else:
                 led.blink_for(Led.ERROR, 5000)
             led.set_pattern(Led.IDLE)
-        elif time.ticks_diff(time.ticks_ms(), last_gps_refresh) >= GPS_REFRESH_INTERVAL_MS:
+        elif due(last_gps_refresh, GPS_REFRESH_INTERVAL_MS):
             last_gps_refresh = time.ticks_ms()
             if modem.ensure_awake() and modem.wait_for_network(led, NETWORK_TIMEOUT_MS):
                 refresh_gps_cache(modem, led)
