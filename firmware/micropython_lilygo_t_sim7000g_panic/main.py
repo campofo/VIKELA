@@ -342,6 +342,14 @@ class Sim7000:
             # modem), which is what lets the handshake to Google/Firebase complete.
             self.at('AT+CSSLCFG="sslversion",1,3', 3000)
             self.at('AT+CSSLCFG="authmode",1,0', 3000)
+            # Google Cloud Functions requires Server Name Indication (SNI) during
+            # the TLS handshake. Without it SHCONN fails against the endpoint.
+            # Some older SIM7000G firmware lacks this command; warn but continue
+            # so those modems still attempt the handshake.
+            ok_sni, _ = self.at('AT+CSSLCFG="sni",1,"{}"'.format(parsed["host"]), 3000)
+            if not ok_sni:
+                print("WARNING: modem does not support SNI - SHCONN will likely "
+                      "fail against Google endpoints.")
             ok, _ = self.at('AT+SHSSL=1,""', 3000)
             if not ok:
                 print("TLS setup (SHSSL) failed on modem.")
