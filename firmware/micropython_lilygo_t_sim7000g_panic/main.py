@@ -361,15 +361,25 @@ class Sim7000:
         self.at('AT+SHCONF="BODYLEN",1024', 3000)
         self.at('AT+SHCONF="HEADERLEN",350', 3000)
 
-        ok, conn_response = self.at("AT+SHCONN", timeout_ms)
-        if not ok:
-            print("SHCONN failed (could not connect to server):", conn_response.strip())
+        # SHCONN can intermittently return "operation not allowed" on the
+        # SIM7000G (stale SH session or transient bearer state). Retry with a
+        # clean disconnect and a short pause between attempts.
+        connected = False
+        for attempt in range(3):
+            ok, conn_response = self.at("AT+SHCONN", timeout_ms)
+            if ok:
+                ok_state, state = self.at("AT+SHSTATE?", 3000)
+                if ok_state and "+SHSTATE: 1" in state:
+                    connected = True
+                    break
+                print("SHCONN ok but SH state not established.")
+            else:
+                print("SHCONN attempt {} failed: {}".format(
+                    attempt + 1, conn_response.strip()))
             self.at("AT+SHDISC", 2000)
-            return False
-
-        ok, state = self.at("AT+SHSTATE?", 3000)
-        if not ok or "+SHSTATE: 1" not in state:
-            print("SH connection not established.")
+            time.sleep_ms(2000)
+        if not connected:
+            print("SHCONN failed (could not connect to server).")
             self.at("AT+SHDISC", 2000)
             return False
 
