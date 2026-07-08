@@ -56,3 +56,16 @@ class Alert(SQLModel, table=True):
     source: str = "hardware"
     status: str = "received"
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class LocationPing(SQLModel, table=True):
+    # A live location update streamed by the device while a panic is active
+    # (every few seconds after a trigger). Linked to the panic Alert when known.
+    id: Optional[int] = Field(default=None, primary_key=True)
+    alert_id: Optional[int] = Field(default=None, foreign_key="alert.id", index=True)
+    device_id: str = Field(index=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    battery_level: Optional[int] = None
+    created_at: datetime = Field(default_factory=_utcnow)

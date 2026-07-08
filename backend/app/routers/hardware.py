@@ -11,8 +11,14 @@ from fastapi import APIRouter, Depends
 from sqlmodel import Session, select
 
 from app.database import get_session
-from app.models import Alert, Device, EmergencyContact
-from app.schemas import AlertUser, HardwareAlertIn, HardwareAlertOut
+from app.models import Alert, Device, EmergencyContact, LocationPing
+from app.schemas import (
+    AlertUser,
+    HardwareAlertIn,
+    HardwareAlertOut,
+    LocationPingAck,
+    LocationPingIn,
+)
 
 router = APIRouter(tags=["hardware"])
 
@@ -58,3 +64,36 @@ def receive_alert(payload: HardwareAlertIn, session: Session = Depends(get_sessi
         user=AlertUser(id=user.id, display_name=user.display_name) if user else None,
         contacts=contacts,
     )
+
+
+@router.post("/api/hardware/location", response_model=LocationPingAck)
+@router.post("/locationUpdate", response_model=LocationPingAck, include_in_schema=False)
+def receive_location(payload: LocationPingIn, session: Session = Depends(get_session)):
+    # A live location update streamed while a panic is active. Records a
+    # LocationPing linked to the device's user (and the panic Alert when the
+    # device sent an alert_id) so the app can show a live track.
+    device = session.get(Device, payload.device_id)
+    user_id = device.user_id if device is not None else None
+    if device is not None:
+        device.last_seen_at = datetime.now(timezone.utc)
+        session.add(device)
+
+    # Ignore an unknown alert_id (e.g. stale on the device) rather than fail the
+    # FK constraint — a ping without a linked alert is still worth recording.
+    alert_id = payload.alert_id
+    if alert_id is not None and session.get(Alert, alert_id) is None:
+        alert_id = None
+
+    ping = LocationPing(
+        alert_id=alert_id,
+        device_id=payload.device_id,
+        user_id=user_id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        battery_level=payload.battery_level,
+    )
+    session.add(ping)
+    session.commit()
+    session.refresh(ping)
+
+    return LocationPingAck(ok=True, ping_id=ping.id, device_paired=user_id is not None)

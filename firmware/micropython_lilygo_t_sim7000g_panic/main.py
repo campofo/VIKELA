@@ -29,6 +29,16 @@ CELLULAR_PASS = ""
 # response; this firmware then sends the SMS over the SIM.
 BACKEND_ALERT_URL = "http://YOUR_SERVER_IP:8081/api/hardware/alert"
 
+# Live location tracking: after a panic trigger, stream the GPS position to the
+# backend every LOCATION_TRACK_INTERVAL_MS so the app can follow the device in
+# real time. Point this at the same server as BACKEND_ALERT_URL.
+LOCATION_UPDATE_URL = "http://YOUR_SERVER_IP:8081/api/hardware/location"
+LOCATION_TRACK_ENABLED = True
+LOCATION_TRACK_INTERVAL_MS = 5000
+# How long to keep streaming after a panic. 0 = until the device is reset or
+# powered off (recommended for an active emergency).
+LOCATION_TRACK_DURATION_MS = 0
+
 # Device/user identity sent in HTTP payloads and SMS fallback messages.
 DEVICE_ID = "VIKELA-T-SIM7000G-001"
 USER_ID = "user-001"
@@ -162,6 +172,8 @@ class Sim7000:
         self.pwrkey = Pin(MODEM_PWRKEY, Pin.OUT)
         self.reset = Pin(MODEM_RST, Pin.OUT)
         self._remote_inbox_cleared = False
+        # alert_id from the most recent alert response, used to tag location pings.
+        self._last_alert_id = None
 
     def clear(self):
         while self.uart.any():
@@ -426,9 +438,26 @@ class Sim7000:
         except (ValueError, TypeError) as exc:
             print("Could not parse backend response JSON:", exc)
             return []
+        # Capture the alert id (only present on alert responses) so live location
+        # pings can be linked to this panic incident.
+        if isinstance(data, dict) and data.get("alert_id") is not None:
+            self._last_alert_id = data.get("alert_id")
         contacts = clean_contact_numbers(data.get("contacts"))
         print("Backend returned {} contact(s).".format(len(contacts)))
         return contacts
+
+    def send_location(self, url, fix, battery, alert_id):
+        # POST one live location update. Reuses http_post_json (which activates
+        # data, opens the SH session, sends, and reads the reply).
+        payload = {
+            "device_id": DEVICE_ID,
+            "latitude": fix["latitude"] if fix else None,
+            "longitude": fix["longitude"] if fix else None,
+            "battery_level": battery,
+            "alert_id": alert_id,
+        }
+        ok, _ = self.http_post_json(url, payload, HTTP_TIMEOUT_MS)
+        return ok
 
     def read_battery(self):
         ok, response = self.at("AT+CBC", 3000)
@@ -920,10 +949,27 @@ def refresh_gps_cache(modem, led):
     led.set_pattern(Led.IDLE)
 
 
+def send_tracking_location(modem, alert_id):
+    # One live-tracking update: grab a fresh GPS fix (fall back to the last saved
+    # one) and POST it to the backend location endpoint, tagged with alert_id.
+    fix = modem.poll_gps_once()
+    if fix:
+        save_last_gps(fix)
+    else:
+        fix = load_last_gps()
+    battery = modem.read_battery()
+    ok = modem.send_location(LOCATION_UPDATE_URL, fix, battery, alert_id)
+    print("Location ping {} (alert {}).".format("sent" if ok else "failed", alert_id))
+    return ok
+
+
 def deliver_alert(modem, led, prefer_cached_location=True):
+    # Returns (delivered, alert_id). alert_id is the backend's id for this panic
+    # (or None if the backend was unreachable), used to tag live location pings.
+    modem._last_alert_id = None
     if not modem.ensure_awake():
         print("Modem did not respond.")
-        return False
+        return False, None
 
     led.set_pattern(Led.WAITING)
     if not modem.wait_for_network(led, NETWORK_TIMEOUT_MS):
@@ -967,7 +1013,7 @@ def deliver_alert(modem, led, prefer_cached_location=True):
             delivered = True
 
     # Delivered if the backend logged the alert or at least one SMS went out.
-    return http_ok or delivered
+    return (http_ok or delivered), modem._last_alert_id
 
 
 def send_boot_sms(modem, led):
@@ -1016,16 +1062,19 @@ def send_boot_sms(modem, led):
 
 
 def send_boot_panic_alert(modem, led):
+    # Returns the alert_id if a boot panic was sent (so the caller can start live
+    # tracking), else None.
     if not SEND_PANIC_ON_BOOT:
-        return
+        return None
 
     print("Sending boot/reset panic alert.")
-    ok = deliver_alert(modem, led, prefer_cached_location=True)
+    ok, alert_id = deliver_alert(modem, led, prefer_cached_location=True)
     if ok:
         led.blink_for(Led.SUCCESS, 2500)
     else:
         led.blink_for(Led.ERROR, 2500)
     led.set_pattern(Led.IDLE)
+    return alert_id if ok else None
 
 
 def main():
@@ -1048,15 +1097,38 @@ def main():
             DEV_SERIAL_TRIGGER_KEY
         ))
     led.set_pattern(Led.IDLE)
+
+    # Live-tracking state. While active, the main loop streams the GPS position
+    # to the backend every LOCATION_TRACK_INTERVAL_MS so the app can follow the
+    # device during an active panic.
+    tracking_active = False
+    tracking_alert_id = None
+    tracking_started = 0
+    last_location_ping = 0
+
+    def start_tracking(alert_id):
+        nonlocal tracking_active, tracking_alert_id, tracking_started, last_location_ping
+        if not LOCATION_TRACK_ENABLED:
+            return
+        tracking_active = True
+        tracking_alert_id = alert_id
+        tracking_started = time.ticks_ms()
+        last_location_ping = time.ticks_ms()
+        print("Live location tracking started (every {} ms, alert {}).".format(
+            LOCATION_TRACK_INTERVAL_MS, alert_id))
+
     send_boot_sms(modem, led)
-    send_boot_panic_alert(modem, led)
+    boot_alert_id = send_boot_panic_alert(modem, led)
+    if boot_alert_id is not None:
+        start_tracking(boot_alert_id)
 
     if panic_from_reset:
         print("RST multi-press panic trigger accepted.")
-        ok = deliver_alert(modem, led, prefer_cached_location=True)
+        ok, alert_id = deliver_alert(modem, led, prefer_cached_location=True)
         led.blink_for(Led.SUCCESS if ok else Led.ERROR, 5000)
         led.set_pattern(Led.IDLE)
         reset_count = 0
+        start_tracking(alert_id)
 
     last_gps_refresh = time.ticks_ms() - GPS_REFRESH_INTERVAL_MS
     last_remote_poll = time.ticks_ms()
@@ -1078,12 +1150,22 @@ def main():
 
         if triggered:
             print("Panic trigger accepted.")
-            ok = deliver_alert(modem, led, prefer_cached_location=True)
+            ok, alert_id = deliver_alert(modem, led, prefer_cached_location=True)
             if ok:
                 led.blink_for(Led.SUCCESS, 5000)
             else:
                 led.blink_for(Led.ERROR, 5000)
             led.set_pattern(Led.IDLE)
+            start_tracking(alert_id)
+        elif tracking_active:
+            # Stream live location while a panic is active. Stop after the
+            # optional duration (0 = keep going until the device is reset).
+            if LOCATION_TRACK_DURATION_MS and due(tracking_started, LOCATION_TRACK_DURATION_MS):
+                tracking_active = False
+                print("Live location tracking stopped (duration elapsed).")
+            elif due(last_location_ping, LOCATION_TRACK_INTERVAL_MS):
+                last_location_ping = time.ticks_ms()
+                send_tracking_location(modem, tracking_alert_id)
         elif due(last_gps_refresh, GPS_REFRESH_INTERVAL_MS):
             last_gps_refresh = time.ticks_ms()
             if modem.ensure_awake() and modem.wait_for_network(led, NETWORK_TIMEOUT_MS):

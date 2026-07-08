@@ -106,6 +106,7 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 7. The backend resolves the device to its owner, records the alert, and returns the user's emergency contacts in the response.
 8. Firmware sends SMS directly through the SIM7000G (`AT+CMGS`) to those contacts (caching them to `panic_contacts.json`). If the backend is unreachable, it falls back to the cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
 9. LED feedback shows waiting, sending, success, or failure.
+10. **Live tracking:** once the panic is delivered, the firmware keeps streaming its GPS position to `POST /api/hardware/location` every `LOCATION_TRACK_INTERVAL_MS` (default 5s), tagged with the `alert_id`, so the app can follow the device in real time. This continues until the device is reset/powered off (or for `LOCATION_TRACK_DURATION_MS` if set to a non-zero cap). Configure via `LOCATION_UPDATE_URL`, `LOCATION_TRACK_ENABLED`, `LOCATION_TRACK_INTERVAL_MS`, and `LOCATION_TRACK_DURATION_MS`.
 
 ## Alert payload
 

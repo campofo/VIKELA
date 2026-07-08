@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
-from app.routers import alerts, contacts, devices, hardware, users
+from app.routers import alerts, contacts, devices, hardware, locations, users
 
 
 @asynccontextmanager
@@ -46,6 +46,7 @@ app.include_router(users.router)
 app.include_router(devices.router)
 app.include_router(contacts.router)
 app.include_router(alerts.router)
+app.include_router(locations.router)
 
 
 @app.get("/health", tags=["meta"])

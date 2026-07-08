@@ -100,6 +100,35 @@ class ContactOut(BaseModel):
     priority: int
 
 
+# --- Live location tracking -----------------------------------------------
+
+class LocationPingIn(BaseModel):
+    # Streamed by the firmware every few seconds while a panic is active.
+    device_id: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    battery_level: Optional[int] = None
+    # The panic Alert this ping belongs to, when the device knows it.
+    alert_id: Optional[int] = None
+
+
+class LocationPingAck(BaseModel):
+    ok: bool
+    ping_id: int
+    device_paired: bool
+
+
+class LocationPingOut(BaseModel):
+    id: int
+    alert_id: Optional[int] = None
+    device_id: str
+    user_id: Optional[int] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    battery_level: Optional[int] = None
+    created_at: datetime
+
+
 # --- Alerts (history) -----------------------------------------------------
 
 class AlertOut(BaseModel):

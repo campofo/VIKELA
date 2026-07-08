@@ -118,9 +118,10 @@ the SIM, caching the contacts to `panic_contacts.json` for offline fallback.
 
 Firmware-facing:
 
-| Method | Path                    | Purpose                                  |
-| ------ | ----------------------- | ---------------------------------------- |
-| POST   | `/api/hardware/alert`   | Ingest a panic alert; returns contacts.  |
+| Method | Path                     | Purpose                                       |
+| ------ | ------------------------ | --------------------------------------------- |
+| POST   | `/api/hardware/alert`    | Ingest a panic alert; returns contacts.       |
+| POST   | `/api/hardware/location` | Ingest a live location ping during a panic.   |
 
 App data API:
 
@@ -141,6 +142,21 @@ App data API:
 | GET    | `/api/users/{user_id}/alerts`     | User alert history          |
 | GET    | `/api/devices/{device_id}/alerts` | Device alert history        |
 | GET    | `/api/alerts/{id}`                | Get a single alert          |
+| GET    | `/api/alerts/{id}/locations`      | Live track for a panic (oldest first) |
+| GET    | `/api/devices/{device_id}/locations` | Recent location pings for a device |
+
+### Live location tracking
+
+After a panic trigger, the device streams its GPS position to
+`POST /api/hardware/location` every few seconds (default 5s), tagged with the
+`alert_id` from the alert response. Each ping is stored in the `locationping`
+table. The app draws the live track from `GET /api/alerts/{id}/locations`.
+
+```bash
+curl -X POST http://YOUR_SERVER_IP:8081/api/hardware/location \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"VIKELA-T-SIM7000G-001","latitude":5.6037,"longitude":-0.187,"battery_level":80,"alert_id":1}'
+```
 
 ## Not included (was Firebase, now out of scope)
 
