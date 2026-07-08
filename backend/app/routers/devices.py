@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from app.database import get_session
-from app.models import Device, User
+from app.models import Alert, Device, User
 from app.schemas import DeviceCreate, DeviceOut, DevicePair
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
@@ -55,6 +55,29 @@ def pair_device(
     device.user_id = payload.user_id
     device.paired_at = datetime.now(timezone.utc)
     session.add(device)
+    session.commit()
+    session.refresh(device)
+    return device
+
+
+@router.post("/{device_id}/resolve", response_model=DeviceOut)
+def resolve_device(device_id: str, session: Session = Depends(get_session)):
+    # Stop live tracking for a device (panic resolved). Also marks the device's
+    # most recent unresolved alert as resolved. Use this when there is no single
+    # alert_id to resolve by (e.g. the original alert POST never reached us).
+    device = session.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    device.tracking_stop_requested = True
+    session.add(device)
+    latest = session.exec(
+        select(Alert)
+        .where(Alert.device_id == device_id, Alert.status != "resolved")
+        .order_by(Alert.created_at.desc())
+    ).first()
+    if latest is not None:
+        latest.status = "resolved"
+        session.add(latest)
     session.commit()
     session.refresh(device)
     return device

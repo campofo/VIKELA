@@ -36,6 +36,21 @@ def init_db():
     from app import models  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
+    _run_light_migrations()
+
+
+def _run_light_migrations():
+    # create_all() never ALTERs existing tables, so add columns introduced after
+    # a deployment's DB was first created. Each step is idempotent.
+    with engine.begin() as conn:
+        device_cols = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(device)").all()
+        }
+        if device_cols and "tracking_stop_requested" not in device_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE device ADD COLUMN "
+                "tracking_stop_requested BOOLEAN NOT NULL DEFAULT 0"
+            )
 
 
 def get_session():

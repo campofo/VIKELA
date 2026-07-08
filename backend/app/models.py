@@ -33,6 +33,9 @@ class Device(SQLModel, table=True):
     label: Optional[str] = None
     paired_at: Optional[datetime] = None
     last_seen_at: Optional[datetime] = None
+    # Set True when a panic is resolved so the device stops streaming location.
+    # Re-armed (set False) whenever a new panic alert is received.
+    tracking_stop_requested: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
 
 

@@ -35,6 +35,8 @@ def receive_alert(payload: HardwareAlertIn, session: Session = Depends(get_sessi
     contacts: list[str] = []
     if device is not None:
         device.last_seen_at = datetime.now(timezone.utc)
+        # A new panic re-arms live tracking (clears any prior resolve/stop).
+        device.tracking_stop_requested = False
         session.add(device)
         if device.user_id is not None:
             from app.models import User
@@ -96,4 +98,13 @@ def receive_location(payload: LocationPingIn, session: Session = Depends(get_ses
     session.commit()
     session.refresh(ping)
 
-    return LocationPingAck(ok=True, ping_id=ping.id, device_paired=user_id is not None)
+    # Tell the device whether to keep streaming. Unknown devices keep tracking
+    # (there's no resolve state for them); a resolved device is told to stop.
+    keep_tracking = True if device is None else not device.tracking_stop_requested
+
+    return LocationPingAck(
+        ok=True,
+        ping_id=ping.id,
+        device_paired=user_id is not None,
+        keep_tracking=keep_tracking,
+    )

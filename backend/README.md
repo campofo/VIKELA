@@ -144,6 +144,8 @@ App data API:
 | GET    | `/api/alerts/{id}`                | Get a single alert          |
 | GET    | `/api/alerts/{id}/locations`      | Live track for a panic (oldest first) |
 | GET    | `/api/devices/{device_id}/locations` | Recent location pings for a device |
+| POST   | `/api/alerts/{id}/resolve`        | Resolve a panic; stops device tracking |
+| POST   | `/api/devices/{device_id}/resolve` | Stop tracking for a device (no alert_id needed) |
 
 ### Live location tracking
 
@@ -157,6 +159,19 @@ curl -X POST http://YOUR_SERVER_IP:8081/api/hardware/location \
   -H 'Content-Type: application/json' \
   -d '{"device_id":"VIKELA-T-SIM7000G-001","latitude":5.6037,"longitude":-0.187,"battery_level":80,"alert_id":1}'
 ```
+
+**Stopping the stream.** The location response carries a `keep_tracking` flag.
+Resolve the panic from the app and the device stops on its next ping:
+
+```bash
+curl -X POST http://YOUR_SERVER_IP:8081/api/alerts/1/resolve         # by incident
+curl -X POST http://YOUR_SERVER_IP:8081/api/devices/VIKELA-T-SIM7000G-001/resolve  # by device
+```
+
+Resolving sets `keep_tracking:false` on subsequent pings (the firmware then
+stops), marks the alert `resolved`, and a fresh panic re-arms tracking
+automatically. A failed/dropped ping never stops tracking — only an explicit
+resolve does.
 
 ## Not included (was Firebase, now out of scope)
 

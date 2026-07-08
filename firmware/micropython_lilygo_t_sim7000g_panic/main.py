@@ -174,6 +174,9 @@ class Sim7000:
         self._remote_inbox_cleared = False
         # alert_id from the most recent alert response, used to tag location pings.
         self._last_alert_id = None
+        # keep_tracking flag from the most recent location response; the backend
+        # sets it False to tell the device to stop streaming (panic resolved).
+        self._last_keep_tracking = True
 
     def clear(self):
         while self.uart.any():
@@ -442,13 +445,19 @@ class Sim7000:
         # pings can be linked to this panic incident.
         if isinstance(data, dict) and data.get("alert_id") is not None:
             self._last_alert_id = data.get("alert_id")
+        # Capture the stop signal (only present on location responses).
+        if isinstance(data, dict) and "keep_tracking" in data:
+            self._last_keep_tracking = bool(data.get("keep_tracking"))
         contacts = clean_contact_numbers(data.get("contacts"))
         print("Backend returned {} contact(s).".format(len(contacts)))
         return contacts
 
     def send_location(self, url, fix, battery, alert_id):
         # POST one live location update. Reuses http_post_json (which activates
-        # data, opens the SH session, sends, and reads the reply).
+        # data, opens the SH session, sends, and reads the reply). Returns
+        # (ok, keep_tracking); keep_tracking stays True unless the backend
+        # explicitly said to stop, so a failed ping never stops tracking.
+        self._last_keep_tracking = True
         payload = {
             "device_id": DEVICE_ID,
             "latitude": fix["latitude"] if fix else None,
@@ -457,7 +466,7 @@ class Sim7000:
             "alert_id": alert_id,
         }
         ok, _ = self.http_post_json(url, payload, HTTP_TIMEOUT_MS)
-        return ok
+        return ok, self._last_keep_tracking
 
     def read_battery(self):
         ok, response = self.at("AT+CBC", 3000)
@@ -952,15 +961,16 @@ def refresh_gps_cache(modem, led):
 def send_tracking_location(modem, alert_id):
     # One live-tracking update: grab a fresh GPS fix (fall back to the last saved
     # one) and POST it to the backend location endpoint, tagged with alert_id.
+    # Returns keep_tracking: False when the backend has resolved the panic.
     fix = modem.poll_gps_once()
     if fix:
         save_last_gps(fix)
     else:
         fix = load_last_gps()
     battery = modem.read_battery()
-    ok = modem.send_location(LOCATION_UPDATE_URL, fix, battery, alert_id)
+    ok, keep_tracking = modem.send_location(LOCATION_UPDATE_URL, fix, battery, alert_id)
     print("Location ping {} (alert {}).".format("sent" if ok else "failed", alert_id))
-    return ok
+    return keep_tracking
 
 
 def deliver_alert(modem, led, prefer_cached_location=True):
@@ -1158,14 +1168,18 @@ def main():
             led.set_pattern(Led.IDLE)
             start_tracking(alert_id)
         elif tracking_active:
-            # Stream live location while a panic is active. Stop after the
-            # optional duration (0 = keep going until the device is reset).
+            # Stream live location while a panic is active. Stop when the backend
+            # resolves the panic, or after the optional duration (0 = keep going
+            # until the device is reset).
             if LOCATION_TRACK_DURATION_MS and due(tracking_started, LOCATION_TRACK_DURATION_MS):
                 tracking_active = False
                 print("Live location tracking stopped (duration elapsed).")
             elif due(last_location_ping, LOCATION_TRACK_INTERVAL_MS):
                 last_location_ping = time.ticks_ms()
-                send_tracking_location(modem, tracking_alert_id)
+                keep_tracking = send_tracking_location(modem, tracking_alert_id)
+                if not keep_tracking:
+                    tracking_active = False
+                    print("Live location tracking stopped (resolved by backend).")
         elif due(last_gps_refresh, GPS_REFRESH_INTERVAL_MS):
             last_gps_refresh = time.ticks_ms()
             if modem.ensure_awake() and modem.wait_for_network(led, NETWORK_TIMEOUT_MS):

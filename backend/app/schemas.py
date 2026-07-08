@@ -116,6 +116,8 @@ class LocationPingAck(BaseModel):
     ok: bool
     ping_id: int
     device_paired: bool
+    # False tells the device to stop streaming location (panic resolved).
+    keep_tracking: bool = True
 
 
 class LocationPingOut(BaseModel):

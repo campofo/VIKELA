@@ -87,6 +87,70 @@ def test_location_alias_path(client):
     assert resp.json()["ok"] is True
 
 
+def test_location_keep_tracking_true_by_default(client):
+    _paired_device_with_alert(client)
+    resp = client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 1.0, "longitude": 1.0},
+    )
+    assert resp.json()["keep_tracking"] is True
+
+
+def test_resolve_alert_stops_tracking(client):
+    _user, alert_id = _paired_device_with_alert(client)
+    # Before resolve: keep_tracking True.
+    r1 = client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 1.0, "longitude": 1.0},
+    )
+    assert r1.json()["keep_tracking"] is True
+
+    resolved = client.post("/api/alerts/{}/resolve".format(alert_id))
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "resolved"
+
+    # After resolve: the next ping is told to stop.
+    r2 = client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 2.0, "longitude": 2.0},
+    )
+    assert r2.json()["keep_tracking"] is False
+
+
+def test_new_alert_rearms_tracking_after_resolve(client):
+    _user, alert_id = _paired_device_with_alert(client)
+    client.post("/api/alerts/{}/resolve".format(alert_id))
+    assert client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 1.0, "longitude": 1.0},
+    ).json()["keep_tracking"] is False
+
+    # A fresh panic re-arms tracking.
+    client.post(
+        "/api/hardware/alert",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 3.0, "longitude": 3.0},
+    )
+    assert client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 4.0, "longitude": 4.0},
+    ).json()["keep_tracking"] is True
+
+
+def test_resolve_device_stops_tracking(client):
+    _paired_device_with_alert(client)
+    resolved = client.post("/api/devices/VIKELA-TEST-1/resolve")
+    assert resolved.status_code == 200
+    assert client.post(
+        "/api/hardware/location",
+        json={"device_id": "VIKELA-TEST-1", "latitude": 1.0, "longitude": 1.0},
+    ).json()["keep_tracking"] is False
+
+
+def test_resolve_missing_alert_or_device_404(client):
+    assert client.post("/api/alerts/999/resolve").status_code == 404
+    assert client.post("/api/devices/NOPE/resolve").status_code == 404
+
+
 def test_location_updates_device_last_seen(client):
     _paired_device_with_alert(client)
     # last_seen was set by the alert; capture then ping and ensure it stays set.
