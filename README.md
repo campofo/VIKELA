@@ -10,11 +10,15 @@ The firmware is intentionally lightweight: its only job is to tell the backend *
 
 ```text
 Hardware device
-  --> POST /api/hardware/alert (FastAPI)  # validates, resolves device -> user
+  --HTTP--> POST :8081/api/hardware/alert (FastAPI)  # validates, resolves device -> user
   --> SQLite alert row (history)
   --> returns emergency contacts
   --> firmware sends SMS via the SIM7000G -> emergency contacts
 ```
+
+The device talks to the backend over **plain HTTP** (default port 8081): the
+SIM7000G modem cannot do TLS reliably, so there is no HTTPS or reverse proxy on
+the alert path. See `backend/DEPLOY.md`.
 
 The mobile app and firmware never talk directly; both interact with the same native backend. The app owns user accounts, medical info, emergency contacts, device pairing (assigns a user to `devices/{deviceId}`), and alert history via the backend's REST API. SMS is always sent from the device's SIM — the backend never sends SMS. If the firmware cannot reach the backend, it falls back to the emergency contacts cached locally on the device.
 
@@ -48,7 +52,7 @@ The MicroPython firmware supports:
 - optional external button (GPIO 32) and serial `p` dev trigger
 - onboard status LED on GPIO 12
 - SIM7000G modem UART on GPIO 26/27
-- HTTPS alert delivery to the native backend's `/api/hardware/alert` endpoint (SIM7000 native TLS)
+- plain-HTTP alert delivery to the native backend's `/api/hardware/alert` endpoint (default port 8081; no TLS, per SIM7000G modem limitations)
 - SMS sent from the SIM7000G to the backend-resolved emergency contacts, with a local cached-contacts fallback when the backend is unreachable
 - GPS location acquisition through the SIM7000G modem
 - battery level reported via `AT+CBC`
@@ -59,7 +63,7 @@ Start with `firmware/micropython_lilygo_t_sim7000g_panic/main.py`. The Arduino/T
 
 1. Flash ESP32 MicroPython firmware to the board.
 2. Edit the configuration section at the top of `firmware/micropython_lilygo_t_sim7000g_panic/main.py`.
-3. Fill in the SIM APN, `BACKEND_ALERT_URL` (the native backend's `/api/hardware/alert` URL), device identity, and the offline-fallback emergency contacts.
+3. Fill in the SIM APN, `BACKEND_ALERT_URL` (the native backend's plain-HTTP `/api/hardware/alert` URL, e.g. `http://YOUR_SERVER_IP:8081/api/hardware/alert`), device identity, and the offline-fallback emergency contacts.
 4. Upload `main.py` to the ESP32 with `mpremote`.
 5. Reset the board and watch the serial logs while testing the panic button.
 

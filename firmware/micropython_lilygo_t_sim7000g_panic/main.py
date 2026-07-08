@@ -20,11 +20,14 @@ CELLULAR_PASS = ""
 
 # HTTP alert endpoint: the VIKELA native backend's hardware-alert URL
 # (backend/app/routers/hardware.py -> POST /api/hardware/alert).
-# For cellular testing, use a public URL. Local 192.168.x.x addresses are
-# usually not reachable from the SIM7000G cellular network.
+# Plain HTTP on the VPS (default port 8081): the SIM7000G modem cannot do TLS
+# reliably, so the device talks HTTP directly to the backend. For an http:// URL
+# the firmware skips all TLS setup (see http_post_json). Replace YOUR_SERVER_IP
+# with your VPS public IP (or a domain). Local 192.168.x.x addresses are usually
+# not reachable from the SIM7000G cellular network.
 # The backend resolves this device's emergency contacts and returns them in the
 # response; this firmware then sends the SMS over the SIM.
-BACKEND_ALERT_URL = "https://your-vikela-backend.example.com/api/hardware/alert"
+BACKEND_ALERT_URL = "http://YOUR_SERVER_IP:8081/api/hardware/alert"
 
 # Device/user identity sent in HTTP payloads and SMS fallback messages.
 DEVICE_ID = "VIKELA-T-SIM7000G-001"

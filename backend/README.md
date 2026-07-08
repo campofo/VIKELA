@@ -91,24 +91,24 @@ pytest
 
 ## Deploy (host it)
 
-To run this on a VPS with Docker behind your own HTTPS reverse proxy, see
-[DEPLOY.md](DEPLOY.md). Quick start:
+To run this on a VPS with Docker over plain HTTP (port 8081) — the hardware
+POSTs directly, no TLS/reverse proxy — see [DEPLOY.md](DEPLOY.md). Quick start:
 
 ```bash
 cd backend
 cp .env.example .env
 docker compose up -d --build
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8081/health
 ```
 
 ## Firmware configuration
 
 Point the firmware at this backend by setting `BACKEND_ALERT_URL` in
 `firmware/micropython_lilygo_t_sim7000g_panic/main.py` to your deployment's
-`/api/hardware/alert` URL, e.g.:
+plain-HTTP `/api/hardware/alert` URL, e.g.:
 
 ```python
-BACKEND_ALERT_URL = "https://your-host.example.com/api/hardware/alert"
+BACKEND_ALERT_URL = "http://YOUR_SERVER_IP:8081/api/hardware/alert"
 ```
 
 The firmware reads the `contacts` list from the response and sends the SMS over

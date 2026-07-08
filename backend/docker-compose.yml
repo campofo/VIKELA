@@ -1,9 +1,8 @@
 # VIKELA backend — single app service on a VPS.
 #
-# TLS is NOT handled here: the app speaks plain HTTP on the published port and is
-# meant to sit behind your own HTTPS reverse proxy / load balancer / CDN.
-# By default it binds to 127.0.0.1 so only a proxy on the same host can reach it.
-# See DEPLOY.md.
+# Plain HTTP, no TLS and no reverse proxy: the SIM7000G hardware cannot do TLS
+# reliably, so it POSTs directly to this service over HTTP. Published on port
+# 8081 by default (open that port in the VPS firewall). See DEPLOY.md.
 
 services:
   app:
@@ -16,10 +15,10 @@ services:
       VIKELA_CORS_ORIGINS: ${VIKELA_CORS_ORIGINS:-*}
     volumes:
       - vikela-data:/data
-    # host bind : container port. Override VIKELA_BIND in .env to expose directly
-    # (e.g. 0.0.0.0:8000) when fronting from another host.
+    # host bind : container port. Public plain-HTTP port the hardware connects to.
+    # Override VIKELA_BIND in .env (e.g. 0.0.0.0:80 if the carrier blocks 8081).
     ports:
-      - "${VIKELA_BIND:-127.0.0.1:8000}:8000"
+      - "${VIKELA_BIND:-0.0.0.0:8081}:8000"
     restart: unless-stopped
 
 volumes:

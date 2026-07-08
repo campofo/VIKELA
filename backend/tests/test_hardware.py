@@ -82,6 +82,20 @@ def test_alert_is_recorded_in_history(client):
     assert len(user_hist) == 1
 
 
+def test_hardware_alert_alias_path(client):
+    # The /hardwareAlert alias (deployment guide / legacy firmware URL) hits the
+    # same handler as /api/hardware/alert.
+    _make_user_with_contacts(client)
+    resp = client.post(
+        "/hardwareAlert",
+        json={"device_id": "VIKELA-TEST-1", "battery_level": 85},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["device_paired"] is True
+    assert body["contacts"] == ["+233504647863", "+233555192380"]
+
+
 def test_alert_updates_device_last_seen(client):
     _make_user_with_contacts(client)
     before = client.get("/api/devices/VIKELA-TEST-1").json()

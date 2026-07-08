@@ -102,7 +102,7 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 3. Firmware waits for network registration.
 4. Firmware attempts to acquire GPS location with `AT+CGNSINF`.
 5. Firmware reads the battery level with `AT+CBC`.
-6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert to the native backend's `/api/hardware/alert` endpoint over TLS using the SIM7000 `AT+SH*` HTTP commands.
+6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert to the native backend's `/api/hardware/alert` endpoint over **plain HTTP** (default port 8081) using the SIM7000 `AT+SH*` HTTP commands.
 7. The backend resolves the device to its owner, records the alert, and returns the user's emergency contacts in the response.
 8. Firmware sends SMS directly through the SIM7000G (`AT+CMGS`) to those contacts (caching them to `panic_contacts.json`). If the backend is unreachable, it falls back to the cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
 9. LED feedback shows waiting, sending, success, or failure.
@@ -139,7 +139,7 @@ Emergency contacts are owned by the backend (managed by the mobile app). On a pa
 
 ## Notes
 
-- HTTPS to the backend uses the SIM7000-native `AT+CNACT` + `AT+SH*` (SHSSL/SHCONN/SHREQ/SHREAD) command set, which does TLS reliably on this modem — unlike the legacy `SAPBR` + `AT+HTTPSSL` bearer path.
+- The device POSTs over **plain HTTP** (`http://…:8081`) using the SIM7000-native `AT+CNACT` + `AT+SH*` (SHCONN/SHREQ/SHREAD) command set. TLS is not used: the SIM7000G modem cannot do it reliably. The firmware still contains the TLS/SNI path (`SHSSL`/`AT+CSSLCFG`) for `https://` URLs, but it stays dormant while `BACKEND_ALERT_URL` is `http://`.
 - The exact `AT+CNACT` argument form can vary by modem firmware revision; the firmware tries the newer `=0,1,"apn"` form then the legacy `=1,"apn"` form.
 - If SMS fallback fails with `CMS ERROR: 500`, set `SMSC_NUMBER` to the SIM network's service-centre number (a data-only SIM may not support SMS at all).
 - Keep Bluetooth pairing out of this build; the priority is standalone cellular reliability.

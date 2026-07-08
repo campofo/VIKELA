@@ -14,10 +14,14 @@ from app.database import get_session
 from app.models import Alert, Device, EmergencyContact
 from app.schemas import AlertUser, HardwareAlertIn, HardwareAlertOut
 
-router = APIRouter(prefix="/api/hardware", tags=["hardware"])
+router = APIRouter(tags=["hardware"])
 
 
-@router.post("/alert", response_model=HardwareAlertOut)
+# Canonical REST path plus the /hardwareAlert alias used by the deployment guide
+# and older firmware URLs. Both hit the same handler; the alias is hidden from
+# the OpenAPI docs to avoid duplication.
+@router.post("/api/hardware/alert", response_model=HardwareAlertOut)
+@router.post("/hardwareAlert", response_model=HardwareAlertOut, include_in_schema=False)
 def receive_alert(payload: HardwareAlertIn, session: Session = Depends(get_session)):
     device = session.get(Device, payload.device_id)
 
