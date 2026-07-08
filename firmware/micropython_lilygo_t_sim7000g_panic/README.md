@@ -40,7 +40,7 @@ README.md
 Edit the configuration section at the top of `main.py` and update:
 
 - SIM APN credentials
-- `BACKEND_ALERT_URL` (Firebase `hardwareAlert` endpoint)
+- `BACKEND_ALERT_URL` (the VPS relay endpoint, e.g. `http://YOUR_SERVER_IP:8081/hardwareAlert`)
 - device ID
 - user ID/display name
 - emergency contact phone numbers used as the offline SMS fallback
@@ -102,9 +102,9 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 3. Firmware waits for network registration.
 4. Firmware attempts to acquire GPS location with `AT+CGNSINF`.
 5. Firmware reads the battery level with `AT+CBC`.
-6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert to the Firebase `hardwareAlert` function over TLS using the SIM7000 `AT+SH*` HTTP commands.
+6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert over **plain HTTP** to the VPS relay (`http://YOUR_SERVER_IP:8081/hardwareAlert`) using the SIM7000 `AT+SH*` HTTP commands. The relay forwards it to the Firebase `hardwareAlert` function over HTTPS (see `relay/`).
 7. Firebase resolves the device to its owner, creates the alert document, and (via `onAlertCreated`) sends SMS to the user's emergency contacts through Agoo SMS.
-8. If Firebase is unreachable, the firmware falls back to sending SMS directly through the SIM7000G (`AT+CMGS`) to the locally cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
+8. If the relay/Firebase is unreachable, the firmware falls back to sending SMS directly through the SIM7000G (`AT+CMGS`) to the locally cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
 9. LED feedback shows waiting, sending, success, or failure.
 
 ## Alert payload
@@ -128,7 +128,7 @@ Emergency contacts are owned by Firestore (managed by the mobile app). The firmw
 
 ## Notes
 
-- HTTPS to Firebase uses the SIM7000-native `AT+CNACT` + `AT+SH*` (SHSSL/SHCONN/SHREQ) command set, which does TLS reliably on this modem — unlike the legacy `SAPBR` + `AT+HTTPSSL` bearer path.
+- The device posts over **plain HTTP** to the VPS relay using the SIM7000-native `AT+CNACT` + `AT+SH*` (SHCONN/SHREQ) command set. TLS is handled by the relay (HTTPS to Firebase), not the modem, which cannot do TLS reliably. Over an `http://` URL the firmware skips all `SHSSL`/`AT+CSSLCFG` setup.
 - The exact `AT+CNACT` argument form can vary by modem firmware revision; the firmware tries the newer `=0,1,"apn"` form then the legacy `=1,"apn"` form.
 - If SMS fallback fails with `CMS ERROR: 500`, set `SMSC_NUMBER` to the SIM network's service-centre number (a data-only SIM may not support SMS at all).
 - Keep Bluetooth pairing out of this build; the priority is standalone cellular reliability.

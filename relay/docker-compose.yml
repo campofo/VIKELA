@@ -1,0 +1,16 @@
+# VIKELA HTTP relay — Hardware --HTTP--> relay --HTTPS--> Firebase.
+#
+# Plain HTTP on port 8081 (the device connects here directly). Not behind
+# Traefik/TLS. The relay forwards to the Firebase Cloud Function over HTTPS.
+
+services:
+  relay:
+    build: .
+    image: vikela-relay
+    environment:
+      FIREBASE_FUNCTION_URL: ${FIREBASE_FUNCTION_URL:-https://europe-west1-dara-cd3e8.cloudfunctions.net/hardwareAlert}
+      RELAY_FORWARD_TIMEOUT: ${RELAY_FORWARD_TIMEOUT:-30}
+    # host bind : container port. Public plain-HTTP port the hardware connects to.
+    ports:
+      - "${RELAY_BIND:-0.0.0.0:8081}:8081"
+    restart: unless-stopped

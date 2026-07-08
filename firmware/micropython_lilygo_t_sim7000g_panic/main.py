@@ -18,11 +18,11 @@ CELLULAR_APN = "internet"
 CELLULAR_USER = ""
 CELLULAR_PASS = ""
 
-# HTTP alert endpoint.
-# For cellular testing, use a public URL. Local 192.168.x.x addresses are
-# usually not reachable from the SIM7000G cellular network.
-# Example: "https://example.com/api/alerts/hardware"
-BACKEND_ALERT_URL = "https://europe-west1-dara-cd3e8.cloudfunctions.net/hardwareAlert"
+# HTTP alert endpoint: the VPS relay, which forwards to Firebase over HTTPS
+# (the modem cannot do TLS reliably, so the device posts plain HTTP here).
+# Replace YOUR_SERVER_IP with your VPS public IP. Local 192.168.x.x addresses
+# are usually not reachable from the SIM7000G cellular network.
+BACKEND_ALERT_URL = "http://YOUR_SERVER_IP:8081/hardwareAlert"
 
 # Device/user identity sent in HTTP payloads and SMS fallback messages.
 DEVICE_ID = "VIKELA-T-SIM7000G-001"
