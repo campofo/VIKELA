@@ -377,13 +377,22 @@ class Sim7000:
         self.at("AT+SHCHEAD", 2000)
         self.at('AT+SHAHEAD="Content-Type","application/json"', 3000)
 
-        ok, _ = self.at("AT+SHBOD={},10000".format(len(body)), 5000, ">")
-        if not ok:
-            print("SHBOD prompt not received.")
-            self.at("AT+SHDISC", 2000)
-            return False
-        self.uart.write(body.encode())
-        self.read_until("OK", 5000)
+        # Set the request body. AT+SHBODEXT takes <len>,<timeout> and returns a
+        # ">" prompt to write the raw bytes (preferred; handles JSON cleanly).
+        # Some SIM7000G firmware only supports the inline AT+SHBOD="<body>",<len>
+        # form (which is why AT+SHBOD=<len>,<timeout> returns "operation not
+        # allowed"), so fall back to that.
+        ok, _ = self.at("AT+SHBODEXT={},10000".format(len(body)), 5000, ">")
+        if ok:
+            self.uart.write(body.encode())
+            self.read_until("OK", 5000)
+        else:
+            inline = body.replace("\\", "\\\\").replace('"', '\\"')
+            ok, _ = self.at('AT+SHBOD="{}",{}'.format(inline, len(body)), 5000)
+            if not ok:
+                print("Failed to set request body (SHBODEXT and SHBOD both refused).")
+                self.at("AT+SHDISC", 2000)
+                return False
 
         self.clear()
         self.uart.write('AT+SHREQ="{}",3\r\n'.format(path).encode())
