@@ -27,7 +27,9 @@ credentials or integration.
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt          # runtime deps
+# For running the tests, install the dev deps instead:
+# pip install -r requirements-dev.txt
 cp .env.example .env    # optional; adjust VIKELA_DB_PATH etc.
 ```
 
@@ -83,7 +85,20 @@ curl http://localhost:8000/api/devices/VIKELA-T-SIM7000G-001/alerts
 
 ```bash
 cd backend
+pip install -r requirements-dev.txt
 pytest
+```
+
+## Deploy (host it)
+
+To run this on a VPS with Docker behind your own HTTPS reverse proxy, see
+[DEPLOY.md](DEPLOY.md). Quick start:
+
+```bash
+cd backend
+cp .env.example .env
+docker compose up -d --build
+curl http://127.0.0.1:8000/health
 ```
 
 ## Firmware configuration
