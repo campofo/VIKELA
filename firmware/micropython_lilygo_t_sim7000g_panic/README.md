@@ -40,7 +40,7 @@ README.md
 Edit the configuration section at the top of `main.py` and update:
 
 - SIM APN credentials
-- `BACKEND_ALERT_URL` (Firebase `hardwareAlert` endpoint)
+- `BACKEND_ALERT_URL` (the native backend's `/api/hardware/alert` endpoint)
 - device ID
 - user ID/display name
 - emergency contact phone numbers used as the offline SMS fallback
@@ -102,9 +102,9 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 3. Firmware waits for network registration.
 4. Firmware attempts to acquire GPS location with `AT+CGNSINF`.
 5. Firmware reads the battery level with `AT+CBC`.
-6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert to the Firebase `hardwareAlert` function over TLS using the SIM7000 `AT+SH*` HTTP commands.
-7. Firebase resolves the device to its owner, creates the alert document, and (via `onAlertCreated`) sends SMS to the user's emergency contacts through Agoo SMS.
-8. If Firebase is unreachable, the firmware falls back to sending SMS directly through the SIM7000G (`AT+CMGS`) to the locally cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
+6. Firmware activates the data context (`AT+CNACT`) and POSTs a JSON alert to the native backend's `/api/hardware/alert` endpoint over TLS using the SIM7000 `AT+SH*` HTTP commands.
+7. The backend resolves the device to its owner, records the alert, and returns the user's emergency contacts in the response.
+8. Firmware sends SMS directly through the SIM7000G (`AT+CMGS`) to those contacts (caching them to `panic_contacts.json`). If the backend is unreachable, it falls back to the cached `panic_contacts.json` list, or the built-in `EMERGENCY_CONTACTS`.
 9. LED feedback shows waiting, sending, success, or failure.
 
 ## Alert payload
@@ -120,15 +120,26 @@ The firmware sends the minimal documented `hardwareAlert` contract as JSON:
 }
 ```
 
-Firebase resolves the user from `device_id` and builds the emergency message itself. When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS fallback says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
+The backend resolves the user from `device_id` and returns the emergency contacts to SMS. When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
 
-## Offline SMS fallback
+The backend responds with the resolved contacts:
 
-Emergency contacts are owned by Firestore (managed by the mobile app). The firmware keeps local numbers only for the offline SMS fallback used when Firebase cannot be reached: a locally-provisioned `panic_contacts.json` cache if present, otherwise the built-in `EMERGENCY_CONTACTS` list.
+```json
+{
+  "alert_id": 42,
+  "device_paired": true,
+  "user": { "id": 1, "display_name": "VIKELA User" },
+  "contacts": ["+233504647863", "+233555192380"]
+}
+```
+
+## SMS delivery and offline fallback
+
+Emergency contacts are owned by the backend (managed by the mobile app). On a panic the firmware SMSs the contacts the backend returns and caches them to `panic_contacts.json`. If the backend cannot be reached, it falls back to that `panic_contacts.json` cache if present, otherwise the built-in `EMERGENCY_CONTACTS` list.
 
 ## Notes
 
-- HTTPS to Firebase uses the SIM7000-native `AT+CNACT` + `AT+SH*` (SHSSL/SHCONN/SHREQ) command set, which does TLS reliably on this modem — unlike the legacy `SAPBR` + `AT+HTTPSSL` bearer path.
+- HTTPS to the backend uses the SIM7000-native `AT+CNACT` + `AT+SH*` (SHSSL/SHCONN/SHREQ/SHREAD) command set, which does TLS reliably on this modem — unlike the legacy `SAPBR` + `AT+HTTPSSL` bearer path.
 - The exact `AT+CNACT` argument form can vary by modem firmware revision; the firmware tries the newer `=0,1,"apn"` form then the legacy `=1,"apn"` form.
 - If SMS fallback fails with `CMS ERROR: 500`, set `SMSC_NUMBER` to the SIM network's service-centre number (a data-only SIM may not support SMS at all).
 - Keep Bluetooth pairing out of this build; the priority is standalone cellular reliability.

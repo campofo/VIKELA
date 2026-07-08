@@ -3,3 +3,10 @@ firmware/**/config.py
 __pycache__/
 *.pyc
 .DS_Store
+
+# Backend runtime artifacts
+backend/.venv/
+backend/.env
+*.db
+*.db-journal
+.pytest_cache/

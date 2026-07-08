@@ -1,22 +1,24 @@
 # VIKELA
 
-VIKELA is a community safety system that combines a mobile app, a Firebase backend, and a standalone hardware panic device.
+VIKELA is a community safety system that combines a mobile app, a self-hosted native backend, and a standalone hardware panic device.
 
 This first implementation uses MicroPython as the main LILYGO T-SIM7000G ESP32 panic-device firmware path.
 
 ## Architecture
 
-The firmware is intentionally lightweight: its only job is to tell Firebase *who it is and where it is*. Everything else is handled by Firebase Cloud Functions and Firestore.
+The firmware is intentionally lightweight: its only job is to tell the backend *who it is and where it is*. The native backend (FastAPI + SQLite, in `backend/`) records the alert and resolves the device to its user's emergency contacts, then returns those contacts so the SIM7000G sends the SMS itself.
 
 ```text
 Hardware device
-  --> hardwareAlert (Cloud Function)   # validates, resolves device -> user
-  --> Firestore alert document
-  --> onAlertCreated (Cloud Function)  # reads emergency contacts, builds message
-  --> Agoo SMS -> emergency contacts
+  --> POST /api/hardware/alert (FastAPI)  # validates, resolves device -> user
+  --> SQLite alert row (history)
+  --> returns emergency contacts
+  --> firmware sends SMS via the SIM7000G -> emergency contacts
 ```
 
-The mobile app and firmware never talk directly; both interact with the same Firebase backend. The app owns user accounts, authentication, medical info, emergency contacts, device pairing (writes the user UID into `devices/{deviceId}`), and alert history. If the firmware cannot reach Firebase, it falls back to sending SMS directly through the SIM7000G.
+The mobile app and firmware never talk directly; both interact with the same native backend. The app owns user accounts, medical info, emergency contacts, device pairing (assigns a user to `devices/{deviceId}`), and alert history via the backend's REST API. SMS is always sent from the device's SIM — the backend never sends SMS. If the firmware cannot reach the backend, it falls back to the emergency contacts cached locally on the device.
+
+See `backend/README.md` for setup, endpoints, and the end-to-end test. Authentication is out of scope for this phase; the data API is unauthenticated.
 
 ## Project structure
 
@@ -29,9 +31,14 @@ firmware/
     lilygo_t_sim7000g_panic.ino
     config.example.h
     README.md
+backend/
+  app/            # FastAPI app, SQLModel models, routers
+  tests/
+  requirements.txt
+  README.md
 ```
 
-The backend runs as Firebase Cloud Functions + Firestore (managed outside this repo).
+The backend runs as a self-hosted FastAPI + SQLite service in `backend/`.
 
 ## Main firmware build
 
@@ -41,8 +48,8 @@ The MicroPython firmware supports:
 - optional external button (GPIO 32) and serial `p` dev trigger
 - onboard status LED on GPIO 12
 - SIM7000G modem UART on GPIO 26/27
-- HTTPS alert delivery to the Firebase `hardwareAlert` function (SIM7000 native TLS)
-- SMS fallback when Firebase is unreachable
+- HTTPS alert delivery to the native backend's `/api/hardware/alert` endpoint (SIM7000 native TLS)
+- SMS sent from the SIM7000G to the backend-resolved emergency contacts, with a local cached-contacts fallback when the backend is unreachable
 - GPS location acquisition through the SIM7000G modem
 - battery level reported via `AT+CBC`
 
@@ -52,7 +59,7 @@ Start with `firmware/micropython_lilygo_t_sim7000g_panic/main.py`. The Arduino/T
 
 1. Flash ESP32 MicroPython firmware to the board.
 2. Edit the configuration section at the top of `firmware/micropython_lilygo_t_sim7000g_panic/main.py`.
-3. Fill in the SIM APN, `BACKEND_ALERT_URL` (Firebase `hardwareAlert` endpoint), device identity, and the offline-fallback emergency contacts.
+3. Fill in the SIM APN, `BACKEND_ALERT_URL` (the native backend's `/api/hardware/alert` URL), device identity, and the offline-fallback emergency contacts.
 4. Upload `main.py` to the ESP32 with `mpremote`.
 5. Reset the board and watch the serial logs while testing the panic button.
 

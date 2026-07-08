@@ -18,11 +18,13 @@ CELLULAR_APN = "internet"
 CELLULAR_USER = ""
 CELLULAR_PASS = ""
 
-# HTTP alert endpoint.
+# HTTP alert endpoint: the VIKELA native backend's hardware-alert URL
+# (backend/app/routers/hardware.py -> POST /api/hardware/alert).
 # For cellular testing, use a public URL. Local 192.168.x.x addresses are
 # usually not reachable from the SIM7000G cellular network.
-# Example: "https://example.com/api/alerts/hardware"
-BACKEND_ALERT_URL = "https://europe-west1-dara-cd3e8.cloudfunctions.net/hardwareAlert"
+# The backend resolves this device's emergency contacts and returns them in the
+# response; this firmware then sends the SMS over the SIM.
+BACKEND_ALERT_URL = "https://your-vikela-backend.example.com/api/hardware/alert"
 
 # Device/user identity sent in HTTP payloads and SMS fallback messages.
 DEVICE_ID = "VIKELA-T-SIM7000G-001"
@@ -30,8 +32,8 @@ USER_ID = "user-001"
 USER_DISPLAY_NAME = "VIKELA User"
 
 # SMS fallback settings.
-# Used only when Firebase is unreachable. Firestore (via the mobile app) is the
-# source of truth for emergency contacts; these locals are the offline backup.
+# Used only when the backend is unreachable. The backend (via the mobile app) is
+# the source of truth for emergency contacts; these locals are the offline backup.
 SMS_MESSAGE_PREFIX = "VIKELA EMERGENCY ALERT"
 EMERGENCY_CONTACTS = [
     "+233504647863"
@@ -321,11 +323,11 @@ class Sim7000:
         parsed = parse_http_url(url)
         if not parsed:
             print("Only http:// and https:// URLs are supported.")
-            return False
+            return False, []
 
         if not self.activate_network():
             print("Data network activation (CNACT) failed.")
-            return False
+            return False, []
 
         body = json.dumps(payload)
         base_url = "{}://{}".format("https" if parsed["ssl"] else "http", parsed["host"])
@@ -339,7 +341,7 @@ class Sim7000:
         if parsed["ssl"]:
             # TLS 1.2 on SSL context 1, bound to the SH HTTP stack. authmode 0
             # skips server-certificate verification (no CA cert is loaded on the
-            # modem), which is what lets the handshake to Google/Firebase complete.
+            # modem), which is what lets the handshake to the backend complete.
             self.at('AT+CSSLCFG="sslversion",1,3', 3000)
             self.at('AT+CSSLCFG="authmode",1,0', 3000)
             # Google Cloud Functions requires Server Name Indication (SNI) during
@@ -353,7 +355,7 @@ class Sim7000:
             ok, _ = self.at('AT+SHSSL=1,""', 3000)
             if not ok:
                 print("TLS setup (SHSSL) failed on modem.")
-                return False
+                return False, []
         else:
             self.at('AT+SHSSL=0,""', 3000)
 
@@ -365,13 +367,13 @@ class Sim7000:
         if not ok:
             print("SHCONN failed (could not connect to server):", conn_response.strip())
             self.at("AT+SHDISC", 2000)
-            return False
+            return False, []
 
         ok, state = self.at("AT+SHSTATE?", 3000)
         if not ok or "+SHSTATE: 1" not in state:
             print("SH connection not established.")
             self.at("AT+SHDISC", 2000)
-            return False
+            return False, []
 
         # Fresh header set with a JSON content type.
         self.at("AT+SHCHEAD", 2000)
@@ -381,7 +383,7 @@ class Sim7000:
         if not ok:
             print("SHBOD prompt not received.")
             self.at("AT+SHDISC", 2000)
-            return False
+            return False, []
         self.uart.write(body.encode())
         self.read_until("OK", 5000)
 
@@ -390,12 +392,40 @@ class Sim7000:
         response = self.read_until("+SHREQ:", timeout_ms)
         response += self.read_until("OK", 5000)
         print("AT<", response.strip())
-        status = shreq_status(response)
+        status, resp_len = shreq_status_and_len(response)
+
+        # On success, read the response body so we can extract the emergency
+        # contacts the backend resolved for this device (the modem never fetches
+        # the body automatically). SMS is sent from the SIM, not the backend.
+        contacts = []
+        if status is not None and 200 <= status < 300 and resp_len:
+            contacts = self.read_response_contacts(resp_len)
+
         self.at("AT+SHDISC", 2000)
         if status is not None and 200 <= status < 300:
-            return True
+            return True, contacts
         print("Server returned HTTP status:", status)
-        return False
+        return False, contacts
+
+    def read_response_contacts(self, length):
+        # Read <length> bytes of the buffered HTTP response via AT+SHREAD and
+        # pull the "contacts" phone-number list out of the JSON body.
+        self.clear()
+        self.uart.write("AT+SHREAD=0,{}\r\n".format(length).encode())
+        raw = self.read_until("+SHREAD:", 5000)
+        raw += self.read_until("OK", 5000)
+        body = extract_json_object(raw)
+        if not body:
+            print("No JSON body in backend response.")
+            return []
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError) as exc:
+            print("Could not parse backend response JSON:", exc)
+            return []
+        contacts = clean_contact_numbers(data.get("contacts"))
+        print("Backend returned {} contact(s).".format(len(contacts)))
+        return contacts
 
     def read_battery(self):
         ok, response = self.at("AT+CBC", 3000)
@@ -504,15 +534,34 @@ def parse_http_url(url):
     return {"host": host, "port": port, "path": path, "ssl": ssl}
 
 
-def shreq_status(response):
-    # Parse the HTTP status from an async +SHREQ: "POST",<status>,<len> line.
+def shreq_status_and_len(response):
+    # Parse an async +SHREQ: "POST",<status>,<len> line into (status, length).
+    # Either element is None when it cannot be parsed.
     for line in response.splitlines():
         if "+SHREQ:" not in line:
             continue
+        fields = line.split(":", 1)[1].split(",")
+        status = None
+        length = None
         try:
-            return int(line.split(":", 1)[1].split(",")[1].strip())
+            status = int(fields[1].strip())
         except (IndexError, ValueError):
-            return None
+            status = None
+        try:
+            length = int(fields[2].strip())
+        except (IndexError, ValueError):
+            length = None
+        return status, length
+    return None, None
+
+
+def extract_json_object(text):
+    # Return the substring from the first '{' to the last '}' (the JSON body in
+    # an AT+SHREAD dump, which is wrapped in +SHREAD:/OK chatter), or None.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
     return None
 
 
@@ -605,10 +654,24 @@ def load_contact_cache():
     return []
 
 
+def save_contact_cache(numbers):
+    # Persist the backend-resolved contacts so a later panic can still SMS them
+    # if the backend is unreachable. Stored in the shape load_contact_cache reads.
+    cleaned = clean_contact_numbers(numbers)
+    if not cleaned:
+        return
+    try:
+        with open(CONTACTS_CACHE_FILE, "w") as handle:
+            handle.write(json.dumps({"phone_numbers": cleaned}))
+        print("Saved panic contact cache ({} numbers).".format(len(cleaned)))
+    except Exception as exc:
+        print("Could not save contact cache:", exc)
+
+
 def get_panic_contacts():
-    # Emergency contacts now live in Firestore (managed by the mobile app).
+    # Emergency contacts live in the backend (managed by the mobile app).
     # The firmware only needs local numbers for the offline SMS fallback used
-    # when Firebase is unreachable: a locally-provisioned cache, else the
+    # when the backend is unreachable: a locally-provisioned cache, else the
     # built-in EMERGENCY_CONTACTS.
     cached = load_contact_cache()
     if cached:
@@ -727,9 +790,9 @@ def evaluate_reset_trigger():
 
 
 def build_alert_payload(fix, battery_level):
-    # Documented Firebase hardwareAlert contract: the firmware only reports who
-    # it is and where it is. Firebase resolves the user from the device ID and
-    # builds the emergency message itself.
+    # Documented hardware-alert contract: the firmware only reports who it is and
+    # where it is. The backend resolves the user from the device ID and returns
+    # the emergency contacts to SMS.
     return {
         "device_id": DEVICE_ID,
         "latitude": fix["latitude"] if fix else None,
@@ -876,18 +939,32 @@ def deliver_alert(modem, led, prefer_cached_location=True):
     led.set_pattern(Led.SENDING)
     battery = modem.read_battery()
     payload = build_alert_payload(fix, battery)
-    if modem.http_post_json(BACKEND_ALERT_URL, payload, HTTP_TIMEOUT_MS):
-        print("HTTP alert delivered.")
-        return True
+    http_ok, contacts = modem.http_post_json(BACKEND_ALERT_URL, payload, HTTP_TIMEOUT_MS)
+    if http_ok:
+        print("Alert logged with backend.")
+    else:
+        print("Backend alert delivery failed.")
 
-    print("HTTP failed; sending SMS fallback.")
+    # SMS is always sent from the SIM (the backend never sends SMS). Prefer the
+    # contacts the backend resolved for this device and cache them; fall back to
+    # the local cache / built-in list when the backend was unreachable.
+    if contacts:
+        save_contact_cache(contacts)
+        sms_targets = contacts
+        print("Sending SMS to backend-resolved contacts.")
+    else:
+        sms_targets = get_panic_contacts()
+        print("Sending SMS to local fallback contacts.")
+
     sms = build_sms_message(fix)
     delivered = False
-    for number in get_panic_contacts():
+    for number in sms_targets:
         led.update()
         if modem.send_sms(number, sms):
             delivered = True
-    return delivered
+
+    # Delivered if the backend logged the alert or at least one SMS went out.
+    return http_ok or delivered
 
 
 def send_boot_sms(modem, led):
