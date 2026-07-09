@@ -21,6 +21,10 @@ The mobile app and firmware never talk directly; both interact with the same Fir
 
 The relay is a stateless HTTP→HTTPS forwarder. See `relay/` and `relay/README.md`.
 
+**Team documentation:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is a full
+system guide with diagrams (topology, end-to-end panic flow, firmware/modem
+internals, relay behaviour, deployment, failure handling).
+
 ## Project structure
 
 ```text
