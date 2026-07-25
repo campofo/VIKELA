@@ -18,17 +18,40 @@ wired to GPIO 32 (to GND, internal pull-up) and added to `PANIC_BUTTON_PINS`.
 
 A panic can be raised without attaching any hardware, using either:
 
-- **RST triple-press** — press the onboard RST button `PANIC_RESET_COUNT` (default 3)
-  times in a row. The firmware counts qualifying resets (via `machine.reset_cause()`
-  plus a small flash counter) and fires once the count is reached. Each press
-  reboots the board, so the alert is sent after the final press.
+- **RST multi-press (classified)** — the number of RST presses selects the
+  emergency type:
+
+  | Presses | Emergency type    | `emergency_type`    |
+  |---------|-------------------|---------------------|
+  | 1       | Security Threat   | `security_threat`   |
+  | 2       | Medical Emergency | `medical_emergency` |
+  | 3       | Accident / Crash  | `accident_crash`    |
+
+  Each press reboots the board and increments a flash counter. After the last
+  press the firmware waits `RESET_MULTIPRESS_WINDOW_MS` for another press, then
+  fires with the matching type; a 3rd press fires immediately (highest category).
+
+  **Warm-reset guard:** on this board an RST press and a real power-on both report
+  `PWRON_RESET`, so a naive counter would treat every power-on as a single press
+  (a false Security Threat on each boot). The modem keeps power across an RST
+  (ESP32-only) reset but is off on a cold power-on, so the firmware treats
+  "modem already awake at boot" as a genuine press and ignores cold power-ons.
+  Governed by `RESET_WARM_GUARD_ENABLED`. This makes single-press classification
+  inherently best-effort — a warm reset from a crash/watchdog/re-flash can also be
+  counted.
+
 - **Remote SMS** — text the device's SIM from a number in `PANIC_CALLER_NUMBERS`.
   The firmware polls for new messages and fires when an authorised sender is seen
   (optionally requiring `PANIC_SMS_KEYWORD` in the body). An incoming *call* from a
   whitelisted number is also detected, but the SIM7000G usually lacks voice, so
   SMS is the reliable remote path.
 
-Held button on GPIO 32 (if wired) and the dev serial `p` key also work.
+Remote SMS, a held GPIO-32 button (if wired), and the dev serial `p` key carry no
+press count, so they use `DEFAULT_EMERGENCY_TYPE`.
+
+> **Backend note:** the firmware sends `emergency_type` in the alert payload, but
+> the Firebase `hardwareAlert` / `onAlertCreated` functions must be updated to read
+> it for the classification to affect the emergency message/response.
 
 ## Files
 
@@ -45,7 +68,8 @@ Edit the configuration section at the top of `main.py` and update:
 - user ID/display name
 - emergency contact phone numbers used as the offline SMS fallback
 - `SMSC_NUMBER` (only needed if SMS sends fail with `CMS ERROR: 500`)
-- RST trigger: `PANIC_RESET_COUNT`, `RESET_MULTIPRESS_WINDOW_MS`, `COUNT_RESET_CAUSE`
+- RST trigger: `PANIC_RESET_COUNT`, `RESET_MULTIPRESS_WINDOW_MS`, `COUNT_RESET_CAUSE`, `RESET_WARM_GUARD_ENABLED`
+- emergency classification: `EMERGENCY_TYPES`, `EMERGENCY_LABELS`, `DEFAULT_EMERGENCY_TYPE`
 - remote trigger: `PANIC_CALLER_NUMBERS`, `PANIC_SMS_KEYWORD`, `REMOTE_TRIGGER_POLL_MS`
 - boot SMS setting and startup message
 - dev serial trigger setting, used when no physical button is attached
@@ -97,7 +121,7 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 > `"pwron"` if your board reports the RST button as a power-on reset (note that
 > the power switch then also counts toward the gesture).
 
-1. A trigger fires (RST x3, an authorised SMS, a held GPIO-32 button, or serial `p`).
+1. A trigger fires (RST 1x/2x/3x for Security/Medical/Accident, an authorised SMS, a held GPIO-32 button, or serial `p`).
 2. Firmware powers/wakes the SIM7000G modem.
 3. Firmware waits for network registration.
 4. Firmware attempts to acquire GPS location with `AT+CGNSINF`.
@@ -109,18 +133,19 @@ For development without a physical button, leave `DEV_SERIAL_TRIGGER_ENABLED = T
 
 ## Alert payload
 
-The firmware sends the minimal documented `hardwareAlert` contract as JSON:
+The firmware sends the `hardwareAlert` contract as JSON:
 
 ```json
 {
   "device_id": "VIKELA-T-SIM7000G-001",
   "latitude": 5.6037,
   "longitude": -0.187,
-  "battery_level": 78
+  "battery_level": 78,
+  "emergency_type": "security_threat"
 }
 ```
 
-Firebase resolves the user from `device_id` and builds the emergency message itself. When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS fallback says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
+Firebase resolves the user from `device_id` and builds the emergency message itself. `emergency_type` is one of `security_threat`, `medical_emergency`, or `accident_crash` (see the classification table above). When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS fallback says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
 
 ## Offline SMS fallback
 

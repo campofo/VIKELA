@@ -72,12 +72,44 @@ GPS_REFRESH_INTERVAL_MS = 60000
 GPS_REFRESH_TIMEOUT_MS = 15000
 
 # RST multi-press trigger (no external button needed).
-# Press the onboard RST button PANIC_RESET_COUNT times in a row to fire a panic.
+# The number of RST presses selects the emergency type:
+#   1 press  -> Security Threat
+#   2 presses -> Medical Emergency
+#   3 presses -> Accident / Crash
+# Each press reboots the board; after the last press the firmware waits
+# RESET_MULTIPRESS_WINDOW_MS for another press, then fires with the matching type
+# (a 3rd press fires immediately, since that is the highest category).
 RESET_TRIGGER_ENABLED = True
-PANIC_RESET_COUNT = 3
-RESET_MULTIPRESS_WINDOW_MS = 10000    # max gap between presses before the count clears
+PANIC_RESET_COUNT = 3                  # highest press count / number of emergency classes
+RESET_MULTIPRESS_WINDOW_MS = 10000     # time to add another press before the count is committed
 RESET_TRIGGER_FILE = "reset_trigger.json"
-COUNT_RESET_CAUSE = "pwron"           # this board reports the RST button as a power-on reset ("hard" if yours reports HARD_RESET)
+COUNT_RESET_CAUSE = "pwron"            # this board reports the RST button as a power-on reset ("hard" if yours reports HARD_RESET)
+# Warm-reset guard: on this board an RST press and a real power-on both report
+# PWRON_RESET. The modem keeps power across an RST (ESP32-only) reset but is off
+# on a cold power-on, so "modem already awake at boot" marks a genuine RST press.
+# This stops a normal power-on from being read as a single press.
+RESET_WARM_GUARD_ENABLED = True
+
+# Emergency classification by RST press count.
+EMERGENCY_TYPES = {
+    1: "security_threat",
+    2: "medical_emergency",
+    3: "accident_crash",
+}
+EMERGENCY_LABELS = {
+    "security_threat": "Security Threat",
+    "medical_emergency": "Medical Emergency",
+    "accident_crash": "Accident / Crash",
+}
+# Emergency type for triggers that don't carry a press count (remote SMS, serial,
+# an external button).
+DEFAULT_EMERGENCY_TYPE = "security_threat"
+
+# Remote trigger: raise a panic by texting the device from an authorised number.
+REMOTE_TRIGGER_ENABLED = True
+PANIC_CALLER_NUMBERS = ["+233504647863", "+233555192380"]
+PANIC_SMS_KEYWORD = ""                # empty = any SMS from a whitelisted number fires; else require this substring
+REMOTE_TRIGGER_POLL_MS = 5000         # how often to poll the modem for new SMS
 
 # Remote trigger: raise a panic by texting the device from an authorised number.
 REMOTE_TRIGGER_ENABLED = True
@@ -186,6 +218,13 @@ class Sim7000:
         response = self.read_until([expected, "ERROR"], timeout_ms)
         print("AT<", response.strip())
         return expected in response, response
+
+    def is_awake(self):
+        # Probe whether the modem already has power WITHOUT powering it up. Used
+        # by the warm-reset guard: the modem survives an RST (ESP32-only) reset
+        # but is off on a cold power-on.
+        ok, _ = self.at("AT", 1000)
+        return ok
 
     def power_cycle(self):
         self.power_on.on()
@@ -719,46 +758,65 @@ def clear_reset_count():
     save_reset_count(0)
 
 
-def evaluate_reset_trigger():
-    # Detect an "RST pressed N times in a row" panic gesture. The RST line is not
-    # a readable GPIO, but the chip reports why it booted, so we count qualifying
-    # resets in flash. Returns (should_panic, current_count).
+def evaluate_reset_trigger(warm_reset):
+    # Count RST presses to classify the emergency. The RST line is not a readable
+    # GPIO, but each press reboots the board, so we accumulate presses in flash.
+    # Returns the current pending press count (0 = no gesture in progress).
     if not RESET_TRIGGER_ENABLED:
-        return False, 0
+        return 0
 
     cause = machine.reset_cause()
     counted_cause = machine.PWRON_RESET if COUNT_RESET_CAUSE == "pwron" else machine.HARD_RESET
-    if cause == counted_cause:
-        count = load_reset_count() + 1
-        print("Counted reset (cause {}). Multi-press count: {}".format(cause, count))
-    else:
-        # Power-on / brownout / soft reset: start the gesture fresh.
-        count = 0
-        print("Boot reset cause {}; multi-press counter cleared.".format(cause))
 
-    if count >= PANIC_RESET_COUNT:
-        print("RST triple-press registered; panic trigger armed.")
+    if cause != counted_cause:
+        # Software reset, watchdog, deep-sleep wake, etc. -- not a button press.
+        print("Boot reset cause {} (not a panic press); counter unchanged.".format(cause))
+        return load_reset_count()
+
+    # Warm-reset guard: distinguish an RST press from a genuine power-on when the
+    # board reports both as PWRON_RESET.
+    if COUNT_RESET_CAUSE == "pwron" and RESET_WARM_GUARD_ENABLED and not warm_reset:
+        print("Cold power-on detected (modem was off); multi-press counter cleared.")
         clear_reset_count()
-        return True, 0
+        return 0
 
+    count = min(load_reset_count() + 1, PANIC_RESET_COUNT)
     save_reset_count(count)
-    return False, count
+    print("RST press registered. Press count: {}".format(count))
+    return count
 
 
-def build_alert_payload(fix, battery_level):
-    # Documented Firebase hardwareAlert contract: the firmware only reports who
-    # it is and where it is. Firebase resolves the user from the device ID and
-    # builds the emergency message itself.
+def emergency_label(emergency_type):
+    return EMERGENCY_LABELS.get(emergency_type, emergency_type)
+
+
+def emergency_type_for(count):
+    # Map an RST press count to an emergency type. count is None for triggers
+    # that carry no press count (remote SMS, serial, external button).
+    if count is None:
+        return DEFAULT_EMERGENCY_TYPE
+    return EMERGENCY_TYPES.get(min(count, PANIC_RESET_COUNT), DEFAULT_EMERGENCY_TYPE)
+
+
+def build_alert_payload(fix, battery_level, emergency_type):
+    # Firebase hardwareAlert contract: the firmware reports who it is, where it
+    # is, and the classified emergency type. Firebase resolves the user from the
+    # device ID and builds the emergency message itself.
     return {
         "device_id": DEVICE_ID,
         "latitude": fix["latitude"] if fix else None,
         "longitude": fix["longitude"] if fix else None,
         "battery_level": battery_level,
+        "emergency_type": emergency_type,
     }
 
 
-def build_sms_message(fix):
-    lines = [SMS_MESSAGE_PREFIX, "Device: {}".format(DEVICE_ID)]
+def build_sms_message(fix, emergency_type):
+    lines = [
+        SMS_MESSAGE_PREFIX,
+        "Type: {}".format(emergency_label(emergency_type)),
+        "Device: {}".format(DEVICE_ID),
+    ]
     if fix:
         lat = "{:.6f}".format(fix["latitude"])
         lon = "{:.6f}".format(fix["longitude"])
@@ -873,7 +931,7 @@ def refresh_gps_cache(modem, led):
     led.set_pattern(Led.IDLE)
 
 
-def deliver_alert(modem, led, prefer_cached_location=True):
+def deliver_alert(modem, led, emergency_type, prefer_cached_location=True):
     if not modem.ensure_awake():
         print("Modem did not respond.")
         return False
@@ -894,13 +952,13 @@ def deliver_alert(modem, led, prefer_cached_location=True):
 
     led.set_pattern(Led.SENDING)
     battery = modem.read_battery()
-    payload = build_alert_payload(fix, battery)
+    payload = build_alert_payload(fix, battery, emergency_type)
     if modem.http_post_json(BACKEND_ALERT_URL, payload, HTTP_TIMEOUT_MS):
         print("HTTP alert delivered.")
         return True
 
     print("HTTP failed; sending SMS fallback.")
-    sms = build_sms_message(fix)
+    sms = build_sms_message(fix, emergency_type)
     delivered = False
     for number in get_panic_contacts():
         led.update()
@@ -959,7 +1017,7 @@ def send_boot_panic_alert(modem, led):
         return
 
     print("Sending boot/reset panic alert.")
-    ok = deliver_alert(modem, led, prefer_cached_location=True)
+    ok = deliver_alert(modem, led, DEFAULT_EMERGENCY_TYPE, prefer_cached_location=True)
     if ok:
         led.blink_for(Led.SUCCESS, 2500)
     else:
@@ -967,19 +1025,32 @@ def send_boot_panic_alert(modem, led):
     led.set_pattern(Led.IDLE)
 
 
+def fire_emergency(modem, led, count):
+    # Deliver an alert classified by RST press count (count=None -> default type).
+    emergency_type = emergency_type_for(count)
+    print("Panic trigger accepted. Emergency: {} ({})".format(
+        emergency_label(emergency_type), emergency_type
+    ))
+    ok = deliver_alert(modem, led, emergency_type, prefer_cached_location=True)
+    led.blink_for(Led.SUCCESS if ok else Led.ERROR, 5000)
+    led.set_pattern(Led.IDLE)
+    return ok
+
+
 def main():
     led = Led(STATUS_LED_PIN, STATUS_LED_ACTIVE_LOW)
     buttons = [Pin(pin, Pin.IN, Pin.PULL_UP) for pin in PANIC_BUTTON_PINS]
     modem = Sim7000()
 
-    panic_from_reset, reset_count = evaluate_reset_trigger()
+    # The modem keeps power across an RST (ESP32-only) reset but is off on a cold
+    # power-on, so its awake state distinguishes a real press from a power-on.
+    warm_reset = modem.is_awake()
+    reset_count = evaluate_reset_trigger(warm_reset)
     reset_window_start = time.ticks_ms()
 
     print("VIKELA MicroPython LILYGO T-SIM7000G panic firmware ready.")
     if RESET_TRIGGER_ENABLED:
-        print("Reset trigger: press RST {} times in a row to send a panic alert.".format(
-            PANIC_RESET_COUNT
-        ))
+        print("Reset trigger: RST 1x=Security, 2x=Medical, 3x=Accident.")
     if REMOTE_TRIGGER_ENABLED:
         print("Remote trigger: text this device from an authorised number to send a panic alert.")
     if DEV_SERIAL_TRIGGER_ENABLED:
@@ -990,11 +1061,10 @@ def main():
     send_boot_sms(modem, led)
     send_boot_panic_alert(modem, led)
 
-    if panic_from_reset:
-        print("RST multi-press panic trigger accepted.")
-        ok = deliver_alert(modem, led, prefer_cached_location=True)
-        led.blink_for(Led.SUCCESS if ok else Led.ERROR, 5000)
-        led.set_pattern(Led.IDLE)
+    # A 3rd press is the highest category, so fire immediately without waiting.
+    if reset_count >= PANIC_RESET_COUNT:
+        clear_reset_count()
+        fire_emergency(modem, led, reset_count)
         reset_count = 0
 
     last_gps_refresh = time.ticks_ms() - GPS_REFRESH_INTERVAL_MS
@@ -1003,12 +1073,15 @@ def main():
     while True:
         led.update()
 
-        # A lone RST press must be followed by the next one within the window,
-        # otherwise the multi-press gesture resets.
+        # Once the multi-press window closes with 1-2 presses, commit that class
+        # and fire the matching emergency type.
         if reset_count > 0 and due(reset_window_start, RESET_MULTIPRESS_WINDOW_MS):
+            print("Multi-press window closed at {} press(es).".format(reset_count))
             clear_reset_count()
+            committed = reset_count
             reset_count = 0
-            print("Reset multi-press window expired; counter cleared.")
+            fire_emergency(modem, led, committed)
+            continue
 
         triggered = wait_for_button_hold(buttons, led) or read_serial_trigger()
         if not triggered and REMOTE_TRIGGER_ENABLED and due(last_remote_poll, REMOTE_TRIGGER_POLL_MS):
@@ -1016,14 +1089,10 @@ def main():
             triggered = modem.check_incoming_call() or modem.check_sms_trigger()
 
         if triggered:
-            print("Panic trigger accepted.")
-            ok = deliver_alert(modem, led, prefer_cached_location=True)
-            if ok:
-                led.blink_for(Led.SUCCESS, 5000)
-            else:
-                led.blink_for(Led.ERROR, 5000)
-            led.set_pattern(Led.IDLE)
-        elif due(last_gps_refresh, GPS_REFRESH_INTERVAL_MS):
+            # Non-RST triggers carry no press count -> default emergency type.
+            fire_emergency(modem, led, None)
+        elif reset_count == 0 and due(last_gps_refresh, GPS_REFRESH_INTERVAL_MS):
+            # Don't start a blocking GPS refresh while a press sequence is pending.
             last_gps_refresh = time.ticks_ms()
             if modem.ensure_awake() and modem.wait_for_network(led, NETWORK_TIMEOUT_MS):
                 refresh_gps_cache(modem, led)

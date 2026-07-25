@@ -49,7 +49,7 @@ The backend runs as Firebase Cloud Functions + Firestore (managed outside this r
 
 The MicroPython firmware supports:
 
-- no-hardware panic triggers: press the onboard RST button 3x, or text the device from an authorised number
+- no-hardware panic triggers: press the onboard RST button to classify the emergency (1x Security, 2x Medical, 3x Accident), or text the device from an authorised number
 - optional external button (GPIO 32) and serial `p` dev trigger
 - onboard status LED on GPIO 12
 - SIM7000G modem UART on GPIO 26/27
