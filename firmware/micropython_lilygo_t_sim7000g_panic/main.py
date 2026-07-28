@@ -39,6 +39,9 @@ EMERGENCY_CONTACTS = [
 # SMS service centre (SMSC) number for the SIM's network. Leave blank to use
 # whatever the SIM provides; set it if SMS sends fail with "CMS ERROR: 500".
 SMSC_NUMBER = ""
+# Max characters for a single text-mode SMS. Going over 160 GSM-7 chars gets the
+# message rejected with "CMS ERROR: 305", so the fallback body is capped here.
+SMS_MAX_LEN = 160
 SEND_BOOT_SMS_ON_START = False
 BOOT_SMS_MESSAGE = "VIKELA device powered on"
 
@@ -81,7 +84,7 @@ GPS_REFRESH_TIMEOUT_MS = 15000
 # (a 3rd press fires immediately, since that is the highest category).
 RESET_TRIGGER_ENABLED = True
 PANIC_RESET_COUNT = 3                  # highest press count / number of emergency classes
-RESET_MULTIPRESS_WINDOW_MS = 10000     # time to add another press before the count is committed
+RESET_MULTIPRESS_WINDOW_MS = 5000      # after the last press, wait this long for another press, then fire
 RESET_TRIGGER_FILE = "reset_trigger.json"
 COUNT_RESET_CAUSE = "pwron"            # this board reports the RST button as a power-on reset ("hard" if yours reports HARD_RESET)
 # Warm-reset guard: on this board an RST press and a real power-on both report
@@ -100,6 +103,13 @@ EMERGENCY_LABELS = {
     "security_threat": "Security Threat",
     "medical_emergency": "Medical Emergency",
     "accident_crash": "Accident / Crash",
+}
+# Tailored responder message per emergency type (sent in the payload and used as
+# the fallback SMS headline).
+EMERGENCY_MESSAGES = {
+    "security_threat": "SECURITY THREAT: VIKELA user triggered a security emergency and may be in danger.",
+    "medical_emergency": "MEDICAL EMERGENCY: VIKELA user needs urgent medical assistance.",
+    "accident_crash": "ACCIDENT / CRASH: VIKELA user may have been in an accident.",
 }
 # Emergency type for triggers that don't carry a press count (remote SMS, serial,
 # an external button).
@@ -222,9 +232,15 @@ class Sim7000:
     def is_awake(self):
         # Probe whether the modem already has power WITHOUT powering it up. Used
         # by the warm-reset guard: the modem survives an RST (ESP32-only) reset
-        # but is off on a cold power-on.
-        ok, _ = self.at("AT", 1000)
-        return ok
+        # but is off on a cold power-on. Retry a few times so a modem that is
+        # briefly slow after the reset transient is not misread as a cold boot
+        # (which would wipe the multi-press counter).
+        for _ in range(3):
+            ok, _ = self.at("AT", 700)
+            if ok:
+                return True
+            time.sleep_ms(200)
+        return False
 
     def power_cycle(self):
         self.power_on.on()
@@ -790,6 +806,10 @@ def emergency_label(emergency_type):
     return EMERGENCY_LABELS.get(emergency_type, emergency_type)
 
 
+def emergency_message(emergency_type):
+    return EMERGENCY_MESSAGES.get(emergency_type, SMS_MESSAGE_PREFIX)
+
+
 def emergency_type_for(count):
     # Map an RST press count to an emergency type. count is None for triggers
     # that carry no press count (remote SMS, serial, external button).
@@ -808,29 +828,25 @@ def build_alert_payload(fix, battery_level, emergency_type):
         "longitude": fix["longitude"] if fix else None,
         "battery_level": battery_level,
         "emergency_type": emergency_type,
+        "message": emergency_message(emergency_type),
     }
 
 
 def build_sms_message(fix, emergency_type):
-    lines = [
-        SMS_MESSAGE_PREFIX,
-        "Type: {}".format(emergency_label(emergency_type)),
-        "Device: {}".format(DEVICE_ID),
-    ]
+    # Keep the fallback SMS compact: the tailored headline (which already states
+    # the type) plus a location line. A single text-mode SMS caps at 160 GSM-7
+    # chars, so drop the redundant Type/Device/Src lines and hard-cap the length.
+    lines = [emergency_message(emergency_type)]
     if fix:
         lat = "{:.6f}".format(fix["latitude"])
         lon = "{:.6f}".format(fix["longitude"])
-        lines.append("GPS: {},{}".format(lat, lon))
-        source = fix.get("source", "sim7000g_gps")
-        age = fix_age_seconds(fix)
-        if age is not None:
-            lines.append("Src: {} Age: {}s".format(source, age))
-        else:
-            lines.append("Src: {}".format(source))
         lines.append("Map: http://maps.google.com/?q={},{}".format(lat, lon))
     else:
         lines.append("Location unavailable")
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    if len(message) > SMS_MAX_LEN:
+        message = message[:SMS_MAX_LEN]
+    return message
 
 
 def append_location_lines(lines, fix):
@@ -1025,6 +1041,15 @@ def send_boot_panic_alert(modem, led):
     led.set_pattern(Led.IDLE)
 
 
+def blink_count(led, n):
+    # Quick visual confirmation of the current press count.
+    for _ in range(n):
+        led.on()
+        time.sleep_ms(180)
+        led.off()
+        time.sleep_ms(220)
+
+
 def fire_emergency(modem, led, count):
     # Deliver an alert classified by RST press count (count=None -> default type).
     emergency_type = emergency_type_for(count)
@@ -1058,6 +1083,10 @@ def main():
             DEV_SERIAL_TRIGGER_KEY
         ))
     led.set_pattern(Led.IDLE)
+    # Blink the current press count so it is obvious a press registered and how
+    # many are counted so far (press again within the window to escalate).
+    if reset_count > 0:
+        blink_count(led, reset_count)
     send_boot_sms(modem, led)
     send_boot_panic_alert(modem, led)
 
