@@ -81,7 +81,7 @@ GPS_REFRESH_TIMEOUT_MS = 15000
 # (a 3rd press fires immediately, since that is the highest category).
 RESET_TRIGGER_ENABLED = True
 PANIC_RESET_COUNT = 3                  # highest press count / number of emergency classes
-RESET_MULTIPRESS_WINDOW_MS = 10000     # time to add another press before the count is committed
+RESET_MULTIPRESS_WINDOW_MS = 5000      # after the last press, wait this long for another press, then fire
 RESET_TRIGGER_FILE = "reset_trigger.json"
 COUNT_RESET_CAUSE = "pwron"            # this board reports the RST button as a power-on reset ("hard" if yours reports HARD_RESET)
 # Warm-reset guard: on this board an RST press and a real power-on both report
@@ -229,9 +229,15 @@ class Sim7000:
     def is_awake(self):
         # Probe whether the modem already has power WITHOUT powering it up. Used
         # by the warm-reset guard: the modem survives an RST (ESP32-only) reset
-        # but is off on a cold power-on.
-        ok, _ = self.at("AT", 1000)
-        return ok
+        # but is off on a cold power-on. Retry a few times so a modem that is
+        # briefly slow after the reset transient is not misread as a cold boot
+        # (which would wipe the multi-press counter).
+        for _ in range(3):
+            ok, _ = self.at("AT", 700)
+            if ok:
+                return True
+            time.sleep_ms(200)
+        return False
 
     def power_cycle(self):
         self.power_on.on()
@@ -1037,6 +1043,15 @@ def send_boot_panic_alert(modem, led):
     led.set_pattern(Led.IDLE)
 
 
+def blink_count(led, n):
+    # Quick visual confirmation of the current press count.
+    for _ in range(n):
+        led.on()
+        time.sleep_ms(180)
+        led.off()
+        time.sleep_ms(220)
+
+
 def fire_emergency(modem, led, count):
     # Deliver an alert classified by RST press count (count=None -> default type).
     emergency_type = emergency_type_for(count)
@@ -1070,6 +1085,10 @@ def main():
             DEV_SERIAL_TRIGGER_KEY
         ))
     led.set_pattern(Led.IDLE)
+    # Blink the current press count so it is obvious a press registered and how
+    # many are counted so far (press again within the window to escalate).
+    if reset_count > 0:
+        blink_count(led, reset_count)
     send_boot_sms(modem, led)
     send_boot_panic_alert(modem, led)
 
