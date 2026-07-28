@@ -39,6 +39,9 @@ EMERGENCY_CONTACTS = [
 # SMS service centre (SMSC) number for the SIM's network. Leave blank to use
 # whatever the SIM provides; set it if SMS sends fail with "CMS ERROR: 500".
 SMSC_NUMBER = ""
+# Max characters for a single text-mode SMS. Going over 160 GSM-7 chars gets the
+# message rejected with "CMS ERROR: 305", so the fallback body is capped here.
+SMS_MAX_LEN = 160
 SEND_BOOT_SMS_ON_START = False
 BOOT_SMS_MESSAGE = "VIKELA device powered on"
 
@@ -830,25 +833,20 @@ def build_alert_payload(fix, battery_level, emergency_type):
 
 
 def build_sms_message(fix, emergency_type):
-    lines = [
-        emergency_message(emergency_type),
-        "Type: {}".format(emergency_label(emergency_type)),
-        "Device: {}".format(DEVICE_ID),
-    ]
+    # Keep the fallback SMS compact: the tailored headline (which already states
+    # the type) plus a location line. A single text-mode SMS caps at 160 GSM-7
+    # chars, so drop the redundant Type/Device/Src lines and hard-cap the length.
+    lines = [emergency_message(emergency_type)]
     if fix:
         lat = "{:.6f}".format(fix["latitude"])
         lon = "{:.6f}".format(fix["longitude"])
-        lines.append("GPS: {},{}".format(lat, lon))
-        source = fix.get("source", "sim7000g_gps")
-        age = fix_age_seconds(fix)
-        if age is not None:
-            lines.append("Src: {} Age: {}s".format(source, age))
-        else:
-            lines.append("Src: {}".format(source))
         lines.append("Map: http://maps.google.com/?q={},{}".format(lat, lon))
     else:
         lines.append("Location unavailable")
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    if len(message) > SMS_MAX_LEN:
+        message = message[:SMS_MAX_LEN]
+    return message
 
 
 def append_location_lines(lines, fix):
