@@ -101,6 +101,13 @@ EMERGENCY_LABELS = {
     "medical_emergency": "Medical Emergency",
     "accident_crash": "Accident / Crash",
 }
+# Tailored responder message per emergency type (sent in the payload and used as
+# the fallback SMS headline).
+EMERGENCY_MESSAGES = {
+    "security_threat": "SECURITY THREAT: VIKELA user triggered a security emergency and may be in danger.",
+    "medical_emergency": "MEDICAL EMERGENCY: VIKELA user needs urgent medical assistance.",
+    "accident_crash": "ACCIDENT / CRASH: VIKELA user may have been in an accident.",
+}
 # Emergency type for triggers that don't carry a press count (remote SMS, serial,
 # an external button).
 DEFAULT_EMERGENCY_TYPE = "security_threat"
@@ -790,6 +797,10 @@ def emergency_label(emergency_type):
     return EMERGENCY_LABELS.get(emergency_type, emergency_type)
 
 
+def emergency_message(emergency_type):
+    return EMERGENCY_MESSAGES.get(emergency_type, SMS_MESSAGE_PREFIX)
+
+
 def emergency_type_for(count):
     # Map an RST press count to an emergency type. count is None for triggers
     # that carry no press count (remote SMS, serial, external button).
@@ -808,12 +819,13 @@ def build_alert_payload(fix, battery_level, emergency_type):
         "longitude": fix["longitude"] if fix else None,
         "battery_level": battery_level,
         "emergency_type": emergency_type,
+        "message": emergency_message(emergency_type),
     }
 
 
 def build_sms_message(fix, emergency_type):
     lines = [
-        SMS_MESSAGE_PREFIX,
+        emergency_message(emergency_type),
         "Type: {}".format(emergency_label(emergency_type)),
         "Device: {}".format(DEVICE_ID),
     ]

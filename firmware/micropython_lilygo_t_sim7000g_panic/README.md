@@ -69,7 +69,7 @@ Edit the configuration section at the top of `main.py` and update:
 - emergency contact phone numbers used as the offline SMS fallback
 - `SMSC_NUMBER` (only needed if SMS sends fail with `CMS ERROR: 500`)
 - RST trigger: `PANIC_RESET_COUNT`, `RESET_MULTIPRESS_WINDOW_MS`, `COUNT_RESET_CAUSE`, `RESET_WARM_GUARD_ENABLED`
-- emergency classification: `EMERGENCY_TYPES`, `EMERGENCY_LABELS`, `DEFAULT_EMERGENCY_TYPE`
+- emergency classification: `EMERGENCY_TYPES`, `EMERGENCY_LABELS`, `EMERGENCY_MESSAGES`, `DEFAULT_EMERGENCY_TYPE`
 - remote trigger: `PANIC_CALLER_NUMBERS`, `PANIC_SMS_KEYWORD`, `REMOTE_TRIGGER_POLL_MS`
 - boot SMS setting and startup message
 - dev serial trigger setting, used when no physical button is attached
@@ -141,11 +141,12 @@ The firmware sends the `hardwareAlert` contract as JSON:
   "latitude": 5.6037,
   "longitude": -0.187,
   "battery_level": 78,
-  "emergency_type": "security_threat"
+  "emergency_type": "security_threat",
+  "message": "SECURITY THREAT: VIKELA user triggered a security emergency and may be in danger."
 }
 ```
 
-Firebase resolves the user from `device_id` and builds the emergency message itself. `emergency_type` is one of `security_threat`, `medical_emergency`, or `accident_crash` (see the classification table above). When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS fallback says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
+Firebase resolves the user from `device_id`. `emergency_type` is one of `security_threat`, `medical_emergency`, or `accident_crash` (see the classification table above), and `message` is the matching tailored text from `EMERGENCY_MESSAGES` — the same text is used as the fallback SMS headline, so the alert wording differs per trigger type. When GPS times out, `latitude` and `longitude` are sent as `null`, and the SMS fallback says location is unavailable. `battery_level` is the charge percentage from `AT+CBC`, or `-1` if it could not be read.
 
 ## Offline SMS fallback
 
